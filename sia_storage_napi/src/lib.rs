@@ -767,7 +767,7 @@ impl Sdk {
     /// Creates a new packed upload for efficiently uploading multiple small
     /// objects together. Returns a `PackedUpload` handle.
     #[napi(ts_args_type = "options?: PackedUploadOptions")]
-    pub fn upload_packed(
+    pub async fn upload_packed(
         &self,
         options: Option<SendablePackedUploadOptions>,
     ) -> Result<PackedUpload> {
@@ -776,6 +776,7 @@ impl Sdk {
         let packed_upload = self
             .inner
             .upload_packed(options)
+            .await
             .map_err(|e| Error::from_reason(e.to_string()))?;
         Ok(PackedUpload {
             inner: Arc::new(tokio::sync::Mutex::new(Some(packed_upload))),
@@ -852,9 +853,17 @@ impl Sdk {
             .unwrap_or_default();
 
         let stream = within_runtime_if_available(|| {
-            let reader = self
-                .inner
-                .download(&object, download_opts)
+            // sia_storage's `download` is async (TESSERA FORK: it does the read-start
+            // `GET /objects/:key/hosts` map fetch itself, see sia_storage/src/sdk.rs).
+            // This NAPI method must stay sync -- it hands back a `ReadableStream`
+            // immediately for JS to start reading, not a Promise -- so the one-time
+            // async setup (the map fetch + stream construction) is resolved here with
+            // `Handle::block_on` rather than turning this method into `async fn`. This is
+            // safe: we're on the raw JS call thread inside `within_runtime_if_available`'s
+            // `rt.enter()` guard, not already inside a polled future on this runtime, so
+            // `block_on` cannot deadlock/panic the way it would from inside a task.
+            let reader = tokio::runtime::Handle::current()
+                .block_on(self.inner.download(&object, download_opts))
                 .map_err(|e| Error::from_reason(e.to_string()))?;
             Ok::<_, Error>(io::AsyncReadStream::new(reader).map(|r| {
                 r.map(Buffer::from)
