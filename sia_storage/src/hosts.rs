@@ -324,6 +324,22 @@ impl Hosts {
         self.hosts.update(new_hosts, clear);
     }
 
+    /// Builds a job-scoped host directory seeded from an explicit list,
+    /// backed by a brand-new [`HostList`] that shares nothing with `self`'s
+    /// list.
+    ///
+    /// TESSERA FORK: used by
+    /// [`crate::Sdk::download`] to resolve one object's
+    /// `GET /objects/:key/hosts` map for that download job only, without
+    /// ever reading from or writing into the shared write-path `Hosts` that
+    /// `upload`/`hosts()` populate. The scoped instance is dropped when the
+    /// download job ends -- nothing here persists across jobs.
+    pub fn scoped(&self, hosts: Vec<Host>) -> Self {
+        let scoped = Self::new(self.transport.clone());
+        scoped.update(hosts, true);
+        scoped
+    }
+
     /// Returns the number of known hosts that are good for upload.
     pub fn available_for_upload(&self) -> usize {
         self.hosts.available_for_upload()

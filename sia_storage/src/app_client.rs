@@ -288,6 +288,24 @@ impl Client {
         }
     }
 
+    /// Retrieves the current host map for one object -- unique host public
+    /// keys drawn from its slabs, with HostInfo attached where known.
+    ///
+    /// TESSERA FORK: backs
+    /// `Sdk::download`'s per-job read-side map, mirroring indexd's
+    /// `GET /objects/:key/hosts` (Slice 1).
+    pub(crate) async fn object_hosts(
+        &self,
+        app_key: &PrivateKey,
+        key: &Hash256,
+    ) -> Result<Vec<Host>, Error> {
+        match self {
+            Self::Http(c) => c.object_hosts(app_key, key).await,
+            #[cfg(any(test, feature = "mock"))]
+            Self::Mock(c) => c.object_hosts(app_key, key).await,
+        }
+    }
+
     /// Fetches a list of objects from the indexer. Can be paginated using the
     /// cursor and limit arguments.
     pub(crate) async fn objects(

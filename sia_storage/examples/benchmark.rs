@@ -451,7 +451,7 @@ async fn warmup(
 
     let download_progress = progress_bar(size as u64, "warm dl ");
     let mut verifier = SeededVerifier::new(seed, size, download_progress.clone());
-    let mut reader = sdk.download(&obj, download_options)?;
+    let mut reader = sdk.download(&obj, download_options).await?;
     copy(&mut reader, &mut verifier).await?;
     download_progress.finish();
     Ok(())
@@ -515,6 +515,7 @@ async fn run_benchmark(
     let mut verifier = SeededVerifier::new(seed, size, download_progress.clone());
     let mut reader = sdk
         .download(&obj, download_options)
+        .await
         .expect("failed to start download");
     copy(&mut reader, &mut verifier)
         .await

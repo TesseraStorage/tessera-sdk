@@ -169,7 +169,7 @@ impl Sdk {
     /// }
     /// ```
     #[wasm_bindgen(unchecked_return_type = "ReadableStream")]
-    pub fn download(
+    pub async fn download(
         &self,
         object: &PinnedObject,
         options: Option<JsValue>,
@@ -177,7 +177,7 @@ impl Sdk {
         const CHUNK_SIZE: usize = 1 << 18; // matches sia_storage chunk size for optimal performance
         let obj = object.0.clone();
         let opts = options.map(download_options_from_js).unwrap_or_default();
-        let download = self.inner.download(&obj, opts).map_err(to_js_err)?;
+        let download = self.inner.download(&obj, opts).await.map_err(to_js_err)?;
         Ok(wasm_streams::ReadableStream::from_async_read(download.compat(), CHUNK_SIZE).into_raw())
     }
 
@@ -215,12 +215,12 @@ impl Sdk {
     /// to avoid wasting storage. Call `add(data)` for each object, then
     /// `finalize()` to get the resulting `PinnedObject` handles.
     #[wasm_bindgen(js_name = "uploadPacked")]
-    pub fn upload_packed(&self, options: Option<JsValue>) -> Result<PackedUpload, JsError> {
+    pub async fn upload_packed(&self, options: Option<JsValue>) -> Result<PackedUpload, JsError> {
         let opts = options
             .map(packed_upload_options_from_js)
             .unwrap_or_default();
         Ok(PackedUpload::new(
-            self.inner.upload_packed(opts).map_err(to_js_err)?,
+            self.inner.upload_packed(opts).await.map_err(to_js_err)?,
         ))
     }
 
@@ -266,8 +266,8 @@ impl Sdk {
 #[wasm_bindgen(typescript_custom_section)]
 const _: &str = r#"
 interface Sdk {
-    download(object: PinnedObject, options?: DownloadOptions): ReadableStream;
+    download(object: PinnedObject, options?: DownloadOptions): Promise<ReadableStream>;
     upload(object: PinnedObject, source: ReadableStream, options?: UploadOptions): Promise<PinnedObject>;
-    uploadPacked(options?: PackedUploadOptions): PackedUpload;
+    uploadPacked(options?: PackedUploadOptions): Promise<PackedUpload>;
 }
 "#;

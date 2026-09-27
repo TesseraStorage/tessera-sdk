@@ -101,6 +101,7 @@ fn upload_benchmark(c: &mut Criterion) {
                             ..Default::default()
                         },
                     )
+                    .await
                     .unwrap();
                 tokio::io::copy(&mut reader, &mut sink())
                     .await
@@ -122,6 +123,7 @@ fn upload_benchmark(c: &mut Criterion) {
                             ..Default::default()
                         },
                     )
+                    .await
                     .unwrap();
                 tokio::io::copy(&mut reader, &mut sink())
                     .await
@@ -135,7 +137,7 @@ fn upload_benchmark(c: &mut Criterion) {
         &object,
         |b, object| {
             b.to_async(&runtime).iter(|| async {
-                let mut reader = sdk.download(object, DownloadOptions::default()).unwrap();
+                let mut reader = sdk.download(object, DownloadOptions::default()).await.unwrap();
                 tokio::io::copy(&mut reader, &mut sink())
                     .await
                     .expect("download to complete");
@@ -155,7 +157,7 @@ fn upload_benchmark(c: &mut Criterion) {
                 let mut total = std::time::Duration::ZERO;
                 for _ in 0..iters {
                     let start = std::time::Instant::now();
-                    let mut reader = sdk.download(&object, DownloadOptions::default()).unwrap();
+                    let mut reader = sdk.download(&object, DownloadOptions::default()).await.unwrap();
                     let mut buf = [0u8; 1];
                     reader.read_exact(&mut buf).await.expect("read to succeed");
                     total += start.elapsed();
@@ -181,6 +183,7 @@ fn upload_benchmark(c: &mut Criterion) {
                                 ..Default::default()
                             },
                         )
+                        .await
                         .unwrap();
                     let mut buf = [0u8; 1];
                     reader.read_exact(&mut buf).await.expect("read to succeed");

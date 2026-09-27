@@ -174,6 +174,18 @@ impl Client {
             .await
     }
 
+    /// Retrieves the current host map for one object (TESSERA FORK,
+    /// Tessera fork) -- mirrors indexd's
+    /// `GET /objects/:key/hosts`.
+    pub(crate) async fn object_hosts(
+        &self,
+        app_key: &PrivateKey,
+        key: &Hash256,
+    ) -> Result<Vec<Host>, Error> {
+        self.get_json::<_, ()>(&format!("objects/{key}/hosts"), app_key, None)
+            .await
+    }
+
     /// Fetches a list of objects from the indexer. Can be paginated using the
     /// cursor and limit arguments.
     pub(crate) async fn objects(

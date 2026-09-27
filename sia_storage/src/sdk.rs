@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use log::{debug, warn};
+use log::debug;
 use reqwest::IntoUrl;
 use sia_core::types::Hash256;
 use thiserror::Error;
@@ -13,8 +13,6 @@ use url::Url;
 use crate::app_client::{self, SlabPinParams};
 use crate::hosts::Hosts;
 use crate::rhp4::{Client, HostEndpoint};
-use crate::task::AbortOnDropHandle;
-use crate::time::Duration;
 use crate::upload::{PackedUpload, upload_object};
 use crate::{
     Account, AppKey, BuilderError, Download, DownloadError, DownloadOptions, Host, HostQuery,
@@ -52,10 +50,19 @@ pub struct Sdk {
     app_key: Arc<AppKey>,
     api_client: app_client::Client,
     hosts: Hosts,
-    _refresh_task: Arc<AbortOnDropHandle<()>>,
 }
 
 impl Sdk {
+    /// Fetches the full write-path host directory (paginated `GET /hosts`)
+    /// and replaces `hosts`'s standing list with it.
+    ///
+    /// TESSERA FORK: this used to
+    /// also run once at connect time and on a 10-minute background loop
+    /// (`Sdk::spawn_refresh_task`, removed). Product law: no standing host
+    /// book. It is now called ONLY at the start of a write job
+    /// (`Sdk::upload`, `Sdk::upload_packed`) -- never at
+    /// `connect`/`unlock`/`list`/`account`, and never for downloads (see
+    /// `Sdk::download`, which fetches its own per-object map instead).
     async fn refresh_hosts(
         app_key: &AppKey,
         api_client: &app_client::Client,
@@ -112,42 +119,22 @@ impl Sdk {
     }
 
     /// Creates a new SDK instance with the provided backends
+    ///
+    /// TESSERA FORK: does NOT
+    /// call `GET /hosts` -- `connected()`/`unlock` must not fetch the write
+    /// plate. `hosts` starts empty; `upload`/`upload_packed` populate it at
+    /// their own job start.
     pub(crate) async fn with_backends(
         api_client: app_client::Client,
         transport: Client,
         app_key: Arc<AppKey>,
     ) -> Result<Self, BuilderError> {
         let hosts = Hosts::new(transport);
-        Self::refresh_hosts(&app_key, &api_client, &hosts).await?;
-        let refresh_task = Self::spawn_refresh_task(
-            app_key.clone(),
-            api_client.clone(),
-            hosts.clone(),
-            Duration::from_secs(10 * 60),
-        );
         Ok(Self {
             app_key,
             api_client,
             hosts,
-            _refresh_task: Arc::new(refresh_task),
         })
-    }
-
-    /// Spawns a background task that refreshes the host list at the given interval.
-    fn spawn_refresh_task(
-        app_key: Arc<AppKey>,
-        api_client: app_client::Client,
-        hosts: Hosts,
-        interval: Duration,
-    ) -> AbortOnDropHandle<()> {
-        AbortOnDropHandle::new(maybe_spawn!(async move {
-            loop {
-                crate::time::sleep(interval).await;
-                if let Err(err) = Self::refresh_hosts(&app_key, &api_client, &hosts).await {
-                    warn!("failed to refresh hosts: {err}");
-                }
-            }
-        }))
     }
 
     /// Returns the application key used by the SDK.
@@ -180,6 +167,11 @@ impl Sdk {
         reader: R,
         options: UploadOptions,
     ) -> Result<Object, UploadError> {
+        // TESSERA FORK: write
+        // start fetches the plate once, in RAM, for this job only (product
+        // law). connect() no longer does this -- upload is now the only
+        // place a write job's host list gets populated.
+        Self::refresh_hosts(&self.app_key, &self.api_client, &self.hosts).await?;
         upload_object(
             self.hosts.clone(),
             self.app_key.clone(),
@@ -220,7 +212,13 @@ impl Sdk {
     ///
     /// # Returns
     /// A [PackedUpload] that can be used to add objects and finalize the upload.
-    pub fn upload_packed(&self, options: PackedUploadOptions) -> Result<PackedUpload, UploadError> {
+    pub async fn upload_packed(
+        &self,
+        options: PackedUploadOptions,
+    ) -> Result<PackedUpload, UploadError> {
+        // TESSERA FORK: same
+        // write-start-fetch law as `upload` -- see that method's comment.
+        Self::refresh_hosts(&self.app_key, &self.api_client, &self.hosts).await?;
         PackedUpload::new(self.hosts.clone(), self.app_key.clone(), options)
     }
 
@@ -228,12 +226,25 @@ impl Sdk {
     /// implements [tokio::io::AsyncRead] — pipe it into any writer with
     /// [tokio::io::copy] or read chunks directly. In-flight chunk recovery is
     /// cancelled when the handle is dropped.
-    pub fn download(
+    pub async fn download(
         &self,
         object: &Object,
         options: DownloadOptions,
     ) -> Result<Download, DownloadError> {
-        Download::new(object, self.hosts.clone(), self.app_key.clone(), options)
+        // TESSERA FORK: read
+        // start fetches THIS object's map -- GET /objects/:key/hosts --
+        // once, into a job-scoped Hosts that shares nothing with the
+        // write-path list `upload` populates. It is used for this download
+        // only and dropped when the returned `Download` is dropped. Product
+        // law: never call GET /hosts to help a download, never glue the
+        // plate into the read path.
+        let map_hosts = self
+            .api_client
+            .object_hosts(&self.app_key.0, &object.id())
+            .await
+            .map_err(|e| DownloadError::Custom(format!("map fetch: {e:?}")))?;
+        let scoped_hosts = self.hosts.scoped(map_hosts);
+        Download::new(object, scoped_hosts, self.app_key.clone(), options)
     }
 
     /// Retrieves a list of hosts from the indexer matching the provided query
@@ -456,6 +467,7 @@ mod test {
 
         let mut reader = sdk
             .download(&fetched, DownloadOptions::default())
+            .await
             .expect("download failed");
         let mut downloaded = Vec::new();
         reader
@@ -474,111 +486,52 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_refresh_task_periodic_and_abort() {
-        use std::sync::Arc;
+    async fn test_no_periodic_host_refresh() {
+        // TESSERA FORK: replaces
+        // the deleted `test_refresh_task_periodic_and_abort`. Product law:
+        // no standing host book, no periodic refresh, `connected()` /
+        // `with_backends` must not call `GET /hosts` at all. Asserts the
+        // negative directly against a counting mock server instead of the
+        // old timing-based spawn/drop dance.
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        use crate::time::Duration;
         use httptest::http::{Response, StatusCode};
         use httptest::matchers::*;
         use httptest::{Expectation, Server};
-        use sia_core::signing::PrivateKey;
-        use sia_core::types::v2::NetAddress;
 
-        use crate::hosts::Hosts;
         use crate::{AppKey, Host};
 
-        const INTERVAL: Duration = Duration::from_millis(200);
-        const WAIT: Duration = Duration::from_millis(500);
-
-        // API returns hosts with good_for_upload=false so warm_connections is a no-op
-        let hosts: Vec<Host> = (0..3)
-            .map(|_| Host {
-                public_key: PrivateKey::from_seed(&random_seed()).public_key(),
-                addresses: vec![NetAddress {
-                    protocol: sia_core::types::v2::Protocol::QUIC,
-                    address: "localhost:1234".to_string(),
-                }],
-                country_code: "US".to_string(),
-                latitude: 0.0,
-                longitude: 0.0,
-                good_for_upload: false,
-            })
-            .collect();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
         let server = Server::run();
         server.expect(
             Expectation::matching(request::method_path("GET", "/hosts"))
                 .times(..)
-                .respond_with(
+                .respond_with(move || {
+                    hits_clone.fetch_add(1, Ordering::SeqCst);
                     Response::builder()
                         .status(StatusCode::OK)
-                        .body(serde_json::to_string(&hosts).unwrap())
-                        .unwrap(),
-                ),
+                        .body(serde_json::to_string(&Vec::<Host>::new()).unwrap())
+                        .unwrap()
+                }),
         );
 
         let app_key = Arc::new(AppKey::import(random_seed()));
         let client = crate::app_client::Client::new(server.url("/").to_string()).unwrap();
-        let hosts = Hosts::new(crate::rhp4::Client::mock());
 
-        // helper: seed one good-for-upload host so available_for_upload() == 1
-        let add_upload_host = |hosts: &Hosts| {
-            hosts.update(
-                vec![Host {
-                    public_key: PrivateKey::from_seed(&random_seed()).public_key(),
-                    addresses: vec![],
-                    country_code: String::new(),
-                    latitude: 0.0,
-                    longitude: 0.0,
-                    good_for_upload: true,
-                }],
-                false,
-            );
-        };
+        let sdk = Sdk::with_backends(client, crate::rhp4::Client::mock(), app_key)
+            .await
+            .expect("sdk creation failed");
 
-        // verify initial refresh replaces hosts
-        add_upload_host(&hosts);
-        assert_eq!(hosts.available_for_upload(), 1);
-        Sdk::refresh_hosts(&app_key, &client, &hosts).await.unwrap();
-        assert_eq!(
-            hosts.available_for_upload(),
-            0,
-            "initial refresh should clear upload hosts"
-        );
+        // `connected()`/`with_backends` must not have touched /hosts.
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "connect must not GET /hosts");
 
-        // spawn the periodic refresh task with a short interval
-        add_upload_host(&hosts);
-        assert_eq!(hosts.available_for_upload(), 1);
-        let handle =
-            Sdk::spawn_refresh_task(app_key.clone(), client.clone(), hosts.clone(), INTERVAL);
+        // No background task exists to fire later, either.
+        tokio::time::sleep(crate::time::Duration::from_millis(300)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "no periodic refresh must fire");
 
-        // wait for periodic refresh to run
-        tokio::time::sleep(WAIT).await;
-        assert_eq!(
-            hosts.available_for_upload(),
-            0,
-            "periodic refresh should have run"
-        );
-
-        // verify it refreshes again
-        add_upload_host(&hosts);
-        tokio::time::sleep(WAIT).await;
-        assert_eq!(
-            hosts.available_for_upload(),
-            0,
-            "second periodic refresh should have run"
-        );
-
-        // drop handle to abort the task
-        drop(handle);
-        add_upload_host(&hosts);
-        assert_eq!(hosts.available_for_upload(), 1);
-
-        // wait past the interval - should NOT refresh (task aborted)
-        tokio::time::sleep(WAIT).await;
-        assert_eq!(
-            hosts.available_for_upload(),
-            1,
-            "refresh task should be aborted"
-        );
+        // sanity: the Sdk still exists and its (empty) host list reflects
+        // that nothing was ever populated outside of an explicit job.
+        drop(sdk);
     }
 }

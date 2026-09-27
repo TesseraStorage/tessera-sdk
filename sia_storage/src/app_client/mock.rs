@@ -133,6 +133,43 @@ impl Client {
             .ok_or_else(|| Error::Api(format!("object {key} not found")))
     }
 
+    /// TESSERA FORK: mirrors
+    /// indexd's `GET /objects/:key/hosts` -- unique host keys from the
+    /// object's current slabs, HostInfo attached where known, missing rows
+    /// omitted (not zeroed/errored).
+    pub(crate) async fn object_hosts(
+        &self,
+        _: &PrivateKey,
+        key: &Hash256,
+    ) -> Result<Vec<Host>, Error> {
+        let state = self.state.read().unwrap();
+        let sealed = state
+            .objects
+            .get(key)
+            .and_then(|o| o.sealed.clone())
+            .ok_or_else(|| Error::Api(format!("object {key} not found")))?;
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for slab in &sealed.slabs {
+            for sector in &slab.sectors {
+                if !seen.insert(sector.host_key) {
+                    continue;
+                }
+                if let Some(h) = state.hosts.iter().find(|h| h.public_key == sector.host_key) {
+                    out.push(Host {
+                        public_key: h.public_key,
+                        addresses: h.addresses.clone(),
+                        country_code: h.country_code.clone(),
+                        latitude: h.latitude,
+                        longitude: h.longitude,
+                        good_for_upload: h.good_for_upload,
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) async fn objects(
         &self,
         _: &PrivateKey,
