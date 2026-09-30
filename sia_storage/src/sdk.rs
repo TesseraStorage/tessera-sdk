@@ -50,6 +50,14 @@ pub struct Sdk {
     app_key: Arc<AppKey>,
     api_client: app_client::Client,
     hosts: Hosts,
+    // TESSERA FORK:
+    // the exact `Vec<Host>` body from this write job's own one `GET
+    // /hosts` (in `refresh_hosts`, below), kept in RAM for the JS/wasm
+    // face to read back via `last_write_plate()` -- "no second fetch."
+    // `Arc<RwLock<...>>` so every `Sdk::clone()` still sees the same
+    // plate; overwritten (not merged) on each new write job, per "lists
+    // do not persist across jobs."
+    last_write_plate: Arc<std::sync::RwLock<Vec<Host>>>,
 }
 
 impl Sdk {
@@ -67,6 +75,7 @@ impl Sdk {
         app_key: &AppKey,
         api_client: &app_client::Client,
         hosts: &Hosts,
+        plate: &Arc<std::sync::RwLock<Vec<Host>>>,
     ) -> Result<(), app_client::Error> {
         const PAGE_SIZE: usize = 100;
         let mut all_hosts = Vec::new();
@@ -87,6 +96,13 @@ impl Sdk {
                 break;
             }
         }
+
+        // TESSERA FORK:
+        // snapshot the exact body of this one `GET /hosts` before it's
+        // consumed by `hosts.update()` below, so `last_write_plate()` can
+        // hand it back to JS without a second fetch. Overwrite, not
+        // append -- "lists do not persist across jobs."
+        *plate.write().unwrap() = all_hosts.clone();
 
         let good_for_upload: Vec<_> = all_hosts
             .iter()
@@ -134,6 +150,7 @@ impl Sdk {
             app_key,
             api_client,
             hosts,
+            last_write_plate: Arc::new(std::sync::RwLock::new(Vec::new())),
         })
     }
 
@@ -143,6 +160,18 @@ impl Sdk {
     /// should store it safely.
     pub fn app_key(&self) -> &AppKey {
         &self.app_key
+    }
+
+    /// Returns the exact host list from this write job's own one `GET
+    /// /hosts` (fetched at `upload`/`upload_packed` start), already in
+    /// RAM. A cheap clone of a cached `Vec`, not a network call --
+    /// this is deliberately NOT a fresh fetch. Empty before any write
+    /// job has run in this `Sdk`'s lifetime, or after a write job dies
+    /// before its list ever arrived.
+    ///
+    /// TESSERA FORK.
+    pub fn last_write_plate(&self) -> Vec<Host> {
+        self.last_write_plate.read().unwrap().clone()
     }
 
     /// Reads until EOF and uploads all slabs. The data will be erasure coded,
@@ -171,7 +200,7 @@ impl Sdk {
         // start fetches the plate once, in RAM, for this job only (product
         // law). connect() no longer does this -- upload is now the only
         // place a write job's host list gets populated.
-        Self::refresh_hosts(&self.app_key, &self.api_client, &self.hosts).await?;
+        Self::refresh_hosts(&self.app_key, &self.api_client, &self.hosts, &self.last_write_plate).await?;
         upload_object(
             self.hosts.clone(),
             self.app_key.clone(),
@@ -218,7 +247,7 @@ impl Sdk {
     ) -> Result<PackedUpload, UploadError> {
         // TESSERA FORK: same
         // write-start-fetch law as `upload` -- see that method's comment.
-        Self::refresh_hosts(&self.app_key, &self.api_client, &self.hosts).await?;
+        Self::refresh_hosts(&self.app_key, &self.api_client, &self.hosts, &self.last_write_plate).await?;
         PackedUpload::new(self.hosts.clone(), self.app_key.clone(), options)
     }
 

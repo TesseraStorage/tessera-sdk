@@ -29,6 +29,25 @@ impl From<sia_storage::ShardProgress> for ShardProgress {
     }
 }
 
+// WRITE-ATTEMPT (2026-09-29, "tessera-web-attempt-arcs-2"): mirrors
+// ShardProgress's own JS shape -- host_key as a string, same format
+// `onShardUploaded` already hands JS. Fired once per write attempt,
+// at dial/WriteSector start, not on land.
+#[derive(serde::Serialize, tsify::Tsify)]
+#[tsify(into_wasm_abi)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteAttempt {
+    pub host_key: String,
+}
+
+impl From<sia_storage::WriteAttempt> for WriteAttempt {
+    fn from(a: sia_storage::WriteAttempt) -> Self {
+        Self {
+            host_key: a.host_key.to_string(),
+        }
+    }
+}
+
 /// Application info registered with the indexer.
 #[derive(serde::Serialize, tsify::Tsify)]
 #[tsify(into_wasm_abi)]
@@ -108,6 +127,7 @@ export interface UploadOptions {
     maxBufferedSlabs?: number;
     startOffset?: bigint;
     onShardUploaded?: (progress: ShardProgress) => void;
+    onWriteAttemptStart?: (attempt: WriteAttempt) => void;
 }
 
 export interface PackedUploadOptions {
@@ -115,6 +135,7 @@ export interface PackedUploadOptions {
     parityShards?: number;
     maxBufferedSlabs?: number;
     onShardUploaded?: (progress: ShardProgress) => void;
+    onWriteAttemptStart?: (attempt: WriteAttempt) => void;
 }
 "#;
 
@@ -122,6 +143,18 @@ fn shard_progress_callback(cb: js_sys::Function) -> sia_storage::ShardProgressCa
     std::sync::Arc::new(move |p: sia_storage::ShardProgress| {
         let progress: ShardProgress = p.into();
         let js_val = serde_wasm_bindgen::to_value(&progress).unwrap_or(JsValue::UNDEFINED);
+        let _ = cb.call1(&JsValue::NULL, &js_val);
+    })
+}
+
+// ATTEMPT-START (2026-09-29, "tessera-web-attempt-arcs-2"): mirrors
+// shard_progress_callback exactly, one level earlier -- fired from
+// `upload::ShardUpload::spawn_write` before `write_sector` dials, not
+// after a shard lands.
+fn write_attempt_callback(cb: js_sys::Function) -> sia_storage::AttemptStartedCallback {
+    std::sync::Arc::new(move |a: sia_storage::WriteAttempt| {
+        let attempt: WriteAttempt = a.into();
+        let js_val = serde_wasm_bindgen::to_value(&attempt).unwrap_or(JsValue::UNDEFINED);
         let _ = cb.call1(&JsValue::NULL, &js_val);
     })
 }
@@ -170,6 +203,9 @@ fn packed_options_from_obj(obj: &js_sys::Object) -> sia_storage::PackedUploadOpt
     }
     if let Some(cb) = get_function(obj, "onShardUploaded") {
         options.shard_uploaded = Some(shard_progress_callback(cb));
+    }
+    if let Some(cb) = get_function(obj, "onWriteAttemptStart") {
+        options.attempt_started = Some(write_attempt_callback(cb));
     }
     options
 }

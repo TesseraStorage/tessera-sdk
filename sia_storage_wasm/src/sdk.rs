@@ -71,6 +71,20 @@ impl Sdk {
         types::to_js(&hosts)
     }
 
+    /// Returns the exact host list from this write job's own one `GET
+    /// /hosts` (fetched at `upload()`/`uploadPacked()` start), already
+    /// held in RAM. This is a cache read, not a network call -- calling
+    /// it does NOT issue a second `/hosts` fetch. Empty until the first
+    /// write job in this `Sdk` instance's lifetime has started fetching
+    /// its plate.
+    ///
+    /// TESSERA FORK.
+    #[wasm_bindgen(js_name = "lastWritePlate", unchecked_return_type = "Host[]")]
+    pub fn last_write_plate(&self) -> Result<JsValue, JsError> {
+        let hosts = self.inner.last_write_plate();
+        types::to_js(&hosts)
+    }
+
     /// Retrieves an object from the indexer by its hex ID.
     /// Returns a `PinnedObject` handle for use with download, share, seal, etc.
     pub async fn object(&self, key_hex: &str) -> Result<PinnedObject, JsError> {

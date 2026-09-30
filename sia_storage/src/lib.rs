@@ -292,6 +292,30 @@ pub type ShardProgressCallback = Arc<dyn Fn(ShardProgress) + Send + Sync + 'stat
 #[cfg(target_arch = "wasm32")]
 pub type ShardProgressCallback = Arc<dyn Fn(ShardProgress) + 'static>;
 
+// WRITE-ATTEMPT callback (2026-09-29, "tessera-web-attempt-arcs-2"):
+// fired at the START of a write effort to a specific host -- dial /
+// WriteSector start, in `upload::ShardUpload::spawn_write` -- not at
+// shard land (that's `ShardProgressCallback`/`on_shard_uploaded`
+// above, which fires from the slab loop after `write_sector` resolves).
+// This is the earliest JS-observable "an attempt to host H just
+// began" signal in the whole client, and the caller already has
+// `host_key: PublicKey` as a plain function parameter at that call
+// site -- no host lookup, no `hosts()` fetch, needed to fire it.
+#[cfg(not(target_arch = "wasm32"))]
+pub type AttemptStartedCallback = Arc<dyn Fn(WriteAttempt) + Send + Sync + 'static>;
+
+#[cfg(target_arch = "wasm32")]
+pub type AttemptStartedCallback = Arc<dyn Fn(WriteAttempt) + 'static>;
+
+/// A single write attempt beginning: this client is about to dial and
+/// `WriteSector` to `host_key`. Fired once per attempt -- a retry to a
+/// different (or, if re-picked, the same) host after a failure fires
+/// again as a new attempt. Never fired for hosts that were only listed
+/// in the upload queue and never actually dialed.
+pub struct WriteAttempt {
+    pub host_key: PublicKey,
+}
+
 /// Information about a successfully uploaded or downloaded shard, used for progress reporting.
 pub struct ShardProgress {
     pub host_key: PublicKey,
@@ -359,6 +383,11 @@ pub struct UploadOptions {
     /// Optional callback to receive progress updates for each uploaded shard.
     pub shard_uploaded: Option<ShardProgressCallback>,
 
+    /// Optional callback fired at the START of each write attempt to a
+    /// host (dial / WriteSector start), before that shard lands. See
+    /// [`WriteAttempt`].
+    pub attempt_started: Option<AttemptStartedCallback>,
+
     /// When set, the reader's data overwrites the object starting at this byte
     /// offset instead of being appended. Only the slabs covering the
     /// overwritten range are rewritten.
@@ -381,6 +410,24 @@ impl UploadOptions {
         F: Fn(ShardProgress) + 'static,
     {
         self.shard_uploaded = Some(Arc::new(callback));
+        self
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn on_write_attempt_start<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(WriteAttempt) + Send + Sync + 'static,
+    {
+        self.attempt_started = Some(Arc::new(callback));
+        self
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn on_write_attempt_start<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(WriteAttempt) + 'static,
+    {
+        self.attempt_started = Some(Arc::new(callback));
         self
     }
 }
@@ -474,6 +521,7 @@ impl Default for UploadOptions {
             parity_shards: 20,
             max_buffered_slabs: None,
             shard_uploaded: None,
+            attempt_started: None,
             start_offset: None,
         }
     }
@@ -496,6 +544,11 @@ pub struct PackedUploadOptions {
 
     /// Optional callback to receive progress updates for each uploaded shard.
     pub shard_uploaded: Option<ShardProgressCallback>,
+
+    /// Optional callback fired at the START of each write attempt to a
+    /// host (dial / WriteSector start), before that shard lands. See
+    /// [`WriteAttempt`].
+    pub attempt_started: Option<AttemptStartedCallback>,
 }
 
 impl Default for PackedUploadOptions {
@@ -505,6 +558,7 @@ impl Default for PackedUploadOptions {
             parity_shards: 20,
             max_buffered_slabs: None,
             shard_uploaded: None,
+            attempt_started: None,
         }
     }
 }
@@ -528,6 +582,7 @@ impl From<PackedUploadOptions> for UploadOptions {
             parity_shards: options.parity_shards,
             max_buffered_slabs: options.max_buffered_slabs,
             shard_uploaded: options.shard_uploaded,
+            attempt_started: options.attempt_started,
             start_offset: None,
         }
     }

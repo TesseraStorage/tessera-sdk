@@ -12,8 +12,8 @@ use crate::slabs::SlabVersion;
 use crate::task::AbortOnDropHandle;
 use crate::time::{Duration, Elapsed, Instant, sleep};
 use crate::{
-    AppKey, Download, DownloadOptions, Hosts, Object, PackedUploadOptions, Sector, ShardProgress,
-    ShardProgressCallback, Slab, UploadOptions,
+    AppKey, AttemptStartedCallback, Download, DownloadOptions, Hosts, Object, PackedUploadOptions,
+    Sector, ShardProgress, ShardProgressCallback, Slab, UploadOptions, WriteAttempt,
 };
 use bytes::Bytes;
 use log::debug;
@@ -59,6 +59,7 @@ struct ShardUpload {
     slab_index: usize,
     shard_index: usize,
     waiting: watch::Sender<usize>,
+    attempt_started: Option<AttemptStartedCallback>,
 }
 
 struct SectorUploadResult {
@@ -236,6 +237,7 @@ impl ShardUpload {
         let data = self.data.clone();
         let slab_index = self.slab_index;
         let shard_index = self.shard_index;
+        let attempt_started = self.attempt_started.clone();
         join_set_spawn!(tasks, async move {
             let _permit = permit;
             // Hold the inflight guard for the duration of the RPC so the
@@ -243,6 +245,15 @@ impl ShardUpload {
             // either after success or failure.
             let _inflight = inflight;
             let sample = limiter.sample();
+            // ATTEMPT-START (2026-09-29, "tessera-web-attempt-arcs-2"):
+            // fire here, before `write_sector` dials/writes -- "the
+            // beginning of the effort," per operator law, not the
+            // shard's land (see ShardProgressCallback below in
+            // spawn_slab's join loop for that). host_key is already a
+            // plain parameter on this function; no hosts() lookup.
+            if let Some(cb) = &attempt_started {
+                cb(WriteAttempt { host_key });
+            }
             let start = Instant::now();
             let result = client
                 .write_sector(host_key, &account_key.0, data, write_timeout)
@@ -421,6 +432,7 @@ pub(crate) struct Upload {
     waiting: watch::Sender<usize>,
     slab_tasks: VecDeque<AbortOnDropHandle<Result<UploadedSlab, UploadError>>>,
     shard_uploaded: Option<ShardProgressCallback>,
+    attempt_started: Option<AttemptStartedCallback>,
 }
 
 impl Upload {
@@ -459,6 +471,7 @@ impl Upload {
             waiting: watch::channel(0).0,
             slab_tasks: VecDeque::new(),
             shard_uploaded: options.shard_uploaded,
+            attempt_started: options.attempt_started,
         })
     }
 
@@ -468,6 +481,7 @@ impl Upload {
         let limiter = self.limiter.clone();
         let app_key = self.app_key.clone();
         let progress_callback = self.shard_uploaded.clone();
+        let attempt_started = self.attempt_started.clone();
         let slab_index = self.slab_tasks.len();
         let shard_permits = limiter.reserve(slab.shards.len()).await;
         // Count this slab's shards as waiting before the task spawns so the
@@ -519,6 +533,7 @@ impl Upload {
                 let limiter = limiter.clone();
                 let hosts = hosts.clone();
                 let waiting = waiting.clone();
+                let attempt_started = attempt_started.clone();
                 join_set_spawn!(shard_tasks, async move {
                     // Hold the memory reservation until the upload finishes (or
                     // this task is dropped), then release it on drop.
@@ -536,6 +551,7 @@ impl Upload {
                         shard_index,
                         hosts,
                         waiting,
+                        attempt_started,
                     };
                     shard_upload.upload_shard(waiting_guard).await
                 });
@@ -933,6 +949,7 @@ mod tests {
             slab_index: 0,
             shard_index: 0,
             waiting: waiting.clone(),
+            attempt_started: None,
         }
     }
 
