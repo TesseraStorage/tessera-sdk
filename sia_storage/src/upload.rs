@@ -13,7 +13,7 @@ use crate::task::AbortOnDropHandle;
 use crate::time::{Duration, Elapsed, Instant, sleep};
 use crate::{
     AppKey, AttemptStartedCallback, Download, DownloadOptions, Hosts, Object, PackedUploadOptions,
-    Sector, ShardProgress, ShardProgressCallback, Slab, UploadOptions, WriteAttempt,
+    Sector, ShardProgress, ShardProgressCallback, Slab, UploadOptions,
 };
 use bytes::Bytes;
 use log::debug;
@@ -245,18 +245,26 @@ impl ShardUpload {
             // either after success or failure.
             let _inflight = inflight;
             let sample = limiter.sample();
-            // ATTEMPT-START (2026-09-29, "tessera-web-attempt-arcs-2"):
-            // fire here, before `write_sector` dials/writes -- "the
-            // beginning of the effort," per operator law, not the
-            // shard's land (see ShardProgressCallback below in
-            // spawn_slab's join loop for that). host_key is already a
-            // plain parameter on this function; no hosts() lookup.
-            if let Some(cb) = &attempt_started {
-                cb(WriteAttempt { host_key });
-            }
+            // ATTEMPT-START (2026-09-29, "tessera-web-attempt-arcs-2";
+            // MOVED 2026-09-30, live operator bug report): used to fire
+            // right here -- before ANY network call for this attempt,
+            // effectively at host-pick time. Operator: "The arc should
+            // start when the write file command is fired. Not warmup
+            // signal, not receive host list." Moved into
+            // `Hosts::write_sector` itself (see that function's own
+            // doc comment) -- fires there, after price-negotiation
+            // ("warmup") completes, immediately before the real
+            // WriteSector RPC is dispatched. Passed through as a
+            // parameter instead of called here.
             let start = Instant::now();
             let result = client
-                .write_sector(host_key, &account_key.0, data, write_timeout)
+                .write_sector(
+                    host_key,
+                    &account_key.0,
+                    data,
+                    write_timeout,
+                    attempt_started.as_ref(),
+                )
                 .await;
             let elapsed = start.elapsed();
             limiter.record(sample, elapsed, result.is_ok());

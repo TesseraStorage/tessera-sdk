@@ -918,6 +918,7 @@ mod test {
                     &app_key.0,
                     Bytes::from(shard),
                     Duration::from_secs(5),
+                    None,
                 )
                 .await
                 .unwrap();

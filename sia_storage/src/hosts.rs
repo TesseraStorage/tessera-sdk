@@ -17,6 +17,7 @@ use tokio::task::JoinSet;
 use crate::hosts::metrics::{HostMetric, HostScore, RPCAverage, Transfer};
 use crate::rhp4::{Client, HostEndpoint, Transport};
 use crate::time::{Duration, Elapsed, Instant, timeout};
+use crate::{AttemptStartedCallback, WriteAttempt};
 
 mod metrics;
 
@@ -495,12 +496,24 @@ impl Hosts {
     /// Performs an upload RPC to the given host. The caller is responsible
     /// for holding the [`InflightGuard`] returned by [`HostQueue::pick`]
     /// for the duration of this call so the host scorer reflects the load.
+    ///
+    /// `attempt_started`, if given, fires exactly once inside this call --
+    /// AFTER price negotiation (the real network "warmup" round-trip
+    /// below) has completed, immediately before the actual WriteSector
+    /// RPC is dispatched to `self.transport`. Live bug fix (2026-09-30,
+    /// operator report on `tessera-web-attempt-arcs-2`): the callback
+    /// used to fire in the caller (`upload::ShardUpload::spawn_write`)
+    /// BEFORE this whole function was even called -- i.e. at host-pick
+    /// time, before price-fetch, before dial. Operator: "The arc should
+    /// start when the write file command is fired. Not warmup signal,
+    /// not receive host list." This is now that exact moment.
     pub async fn write_sector(
         &self,
         host_key: PublicKey,
         account_key: &PrivateKey,
         sector: bytes::Bytes,
         write_timeout: Duration,
+        attempt_started: Option<&AttemptStartedCallback>,
     ) -> Result<Hash256, RPCError> {
         let host = self.host_endpoint(host_key)?;
         timeout(write_timeout, async {
@@ -513,6 +526,9 @@ impl Hosts {
                 false,
             )
             .await?;
+            if let Some(cb) = attempt_started {
+                cb(WriteAttempt { host_key });
+            }
             let bytes = sector.len() as u32;
             let (root, elapsed) = self
                 .transport
