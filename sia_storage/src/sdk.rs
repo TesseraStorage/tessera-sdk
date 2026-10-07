@@ -659,3 +659,136 @@ mod test {
         }
     }
 }
+
+/// Wasm equivalent of [`test_download_reports_served_shards`]: the served
+/// shards recorded by the read path are flushed as signed envelopes.
+///
+/// The reporter and the upload/download jobs spawn through `maybe_spawn!`
+/// (`tokio::task::spawn_local` on wasm), so the test enters a current-thread
+/// runtime and a `LocalSet` explicitly. The flush is forced (`flush_now`); no
+/// wall-clock interval is involved and the mock indexer/transport keep it off
+/// the network.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_test {
+    use super::*;
+    use sia_core::signing::{PublicKey, Signature};
+    use wasm_bindgen_test::*;
+
+    /// Runs `future` on a fresh current-thread runtime with the runtime
+    /// and a `LocalSet` entered, then drives the `LocalSet` to completion.
+    async fn in_local_set<F: std::future::Future>(future: F) -> F::Output {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("creating a tokio runtime must succeed on wasm");
+        let local = tokio::task::LocalSet::new();
+        let output = {
+            let _runtime_guard = runtime.enter();
+            local.run_until(future).await
+        };
+        drop(local);
+        drop(runtime);
+        output
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_download_reports_served_shards_as_signed_envelope() {
+        in_local_set(async {
+            use std::io::Cursor;
+            use tokio::io::AsyncReadExt;
+
+            use crate::mock::MockNetwork;
+            use crate::mock::capture::MockEgress;
+
+            let network = MockNetwork::new();
+            network.add_hosts(35);
+            let capture = MockEgress::new(crate::time::Duration::from_secs(3600), 100_000);
+            let sdk = network
+                .sdk_with_egress(AppKey::import([0x33; 32]), capture.reporter())
+                .await
+                .expect("sdk creation failed");
+
+            // 40 KiB spans two chunks of the single slab.
+            let data: Vec<u8> = (0..40_000).map(|i| i as u8).collect();
+            let object = sdk
+                .upload(
+                    Object::default(),
+                    Cursor::new(data.clone()),
+                    UploadOptions::default(),
+                )
+                .await
+                .expect("upload failed");
+            sdk.pin_object(&object).await.expect("pin failed");
+
+            let fetched = sdk.object(&object.id()).await.expect("object fetch failed");
+            let mut reader = sdk
+                .download(&fetched, DownloadOptions::default())
+                .await
+                .expect("download failed");
+            let mut downloaded = Vec::new();
+            reader
+                .read_to_end(&mut downloaded)
+                .await
+                .expect("read failed");
+            assert_eq!(downloaded, data);
+
+            let events = capture.recorded().await;
+            let min_shards = fetched.slabs()[0].min_shards as usize;
+            assert!(
+                events.len() >= 2 * min_shards,
+                "each of the two chunks reports at least {min_shards} served shards, got {}",
+                events.len()
+            );
+            for event in &events {
+                let event_slab = fetched
+                    .slabs()
+                    .iter()
+                    .find(|slab| Some(slab.digest()) == event.slab_id)
+                    .expect("event must name a slab of the object");
+                let sector = &event_slab.sectors[event.shard_index as usize];
+                assert_eq!(event.host_key, sector.host_key);
+                assert!(event.bytes > 0, "served shards carry a byte count");
+            }
+
+            // `recorded()` force-flushed the read path's queue; assert the
+            // captured envelope is signed over the versioned preimage. The
+            // capture fixture holds its own reporting key (independent of the
+            // SDK's app key), so verify against the identity the envelope
+            // names, exactly like the moneyd ingest does.
+            let attempts = capture.attempts();
+            assert_eq!(
+                attempts.len(),
+                1,
+                "the recorded events must flush as exactly one envelope"
+            );
+            let envelope: serde_json::Value =
+                serde_json::from_slice(&attempts[0]).expect("envelope is json");
+            let identity = envelope["identity"].as_str().expect("identity is a string");
+            assert!(
+                identity.starts_with("ed25519:"),
+                "identity is an ed25519:<hex> string"
+            );
+            let identity_key: PublicKey = identity.parse().expect("identity is a public key");
+
+            let mut body = envelope.clone();
+            body.as_object_mut()
+                .expect("envelope is an object")
+                .remove("signature");
+            let body_bytes = serde_json::to_vec(&body).expect("body serializes");
+            let mut preimage = b"tessera-egress-v1:".to_vec();
+            preimage.extend_from_slice(&body_bytes);
+            let signature = envelope["signature"]
+                .as_str()
+                .expect("signature is a string")
+                .strip_prefix("ed25519:")
+                .expect("signature prefix");
+            let mut sig = [0u8; 64];
+            hex::decode_to_slice(signature, &mut sig).expect("signature is 64 bytes of hex");
+            assert!(
+                identity_key.verify(&preimage, &Signature::from(sig)),
+                "the read path's envelope must carry a valid raw Ed25519 signature"
+            );
+        })
+        .await;
+    }
+}

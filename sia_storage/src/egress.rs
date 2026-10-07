@@ -341,7 +341,6 @@ impl EgressReporter {
 
     /// Forces a flush and returns once no immediate work remains (test-only).
     #[cfg(test)]
-    #[allow(dead_code)] // native tests use it; the wasm suite lands in Task 7
     pub(crate) async fn flush_now(&self) {
         while let FlushOutcome::Sent | FlushOutcome::Dropped = self.inner.flush_attempt(true).await
         {
@@ -350,7 +349,6 @@ impl EgressReporter {
 
     /// Returns the number of events dropped by the bounded queue (test-only).
     #[cfg(test)]
-    #[allow(dead_code)] // native tests use it; the wasm suite lands in Task 7
     pub(crate) fn dropped(&self) -> usize {
         self.inner.dropped.load(Ordering::Relaxed)
     }
@@ -788,6 +786,262 @@ mod test {
             config.reporter(client, app_key).is_some(),
             "reporting must be enabled once a URL is set"
         );
+    }
+
+    /// Wasm-side tests for the reporter's background flusher.
+    ///
+    /// `ensure_flusher` spawns via `maybe_spawn!` (`tokio::task::spawn_local`
+    /// on wasm), which requires an entered `LocalSet`; each test enters a
+    /// fresh current-thread runtime and `LocalSet` explicitly. Flushes are
+    /// driven by `flush_now()` or the batch threshold only — never a
+    /// wall-clock interval — and the "network" is
+    /// [`app_client::mock::Client`], the test transport mock that captures
+    /// every signed envelope the reporter attempts to POST.
+    #[cfg(target_arch = "wasm32")]
+    mod wasm {
+        use super::*;
+        use wasm_bindgen_test::*;
+
+        const TEST_URL: &str = "https://egress.test/api/v1/usage/egress";
+
+        /// Runs `future` on a fresh current-thread runtime with the runtime
+        /// and a `LocalSet` entered, then drives the `LocalSet` to completion.
+        async fn in_local_set<F: std::future::Future>(future: F) -> F::Output {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("creating a tokio runtime must succeed on wasm");
+            let local = tokio::task::LocalSet::new();
+            let output = {
+                let _runtime_guard = runtime.enter();
+                local.run_until(future).await
+            };
+            drop(local);
+            drop(runtime);
+            output
+        }
+
+        fn host(tag: u8) -> PublicKey {
+            PublicKey::new([tag; 32])
+        }
+
+        /// Builds a reporter whose transport is the mocked indexer client and
+        /// returns both; the mock captures every envelope the reporter sends.
+        fn mock_reporter(
+            interval: Duration,
+            batch_max: usize,
+        ) -> (EgressReporter, app_client::mock::Client) {
+            let mock = app_client::mock::Client::new();
+            let reporter = EgressReporter::new(
+                app_client::Client::Mock(mock.clone()),
+                Arc::new(golden_app_key()),
+                TEST_URL.parse().expect("test url"),
+                interval,
+                batch_max,
+                #[cfg(feature = "fs")]
+                None,
+            );
+            (reporter, mock)
+        }
+
+        /// Drives the `LocalSet` until at least `count` envelopes were
+        /// attempted. Only explicit scheduler turns: no wall-clock waits.
+        async fn wait_for_attempts(mock: &app_client::mock::Client, count: usize) {
+            for _ in 0..1000 {
+                if mock.egress_attempts().len() >= count {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                mock.egress_attempts().len() >= count,
+                "the background flusher did not send within 1000 scheduler turns"
+            );
+        }
+
+        /// Asserts the frozen wire contract on a captured signed envelope and
+        /// returns its parsed value: canonical compact JSON, the golden
+        /// `ed25519:<hex>` identity encodings, recomputed totals and a raw
+        /// Ed25519 signature over `b"tessera-egress-v1:" + body` (the
+        /// envelope without `signature`).
+        fn assert_envelope_contract(bytes: &[u8], app_key: &AppKey) -> Value {
+            let text = std::str::from_utf8(bytes).expect("envelope is utf-8");
+            assert!(
+                !text.contains(": ") && !text.contains(", "),
+                "the canonical envelope has no whitespace separators"
+            );
+            let value: Value = serde_json::from_slice(bytes).expect("envelope is json");
+            assert_eq!(
+                value["identity"],
+                Value::String(app_key.public_key().to_string()),
+                "identity must be the signing app key"
+            );
+
+            let batch_id = value["batch_id"].as_str().expect("batch_id is a string");
+            assert_eq!(batch_id.len(), 32, "batch_id is 16 random bytes hex");
+            assert!(
+                batch_id
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "batch_id must be lowercase hex"
+            );
+
+            let events = value["events"].as_array().expect("events is an array");
+            for event in events {
+                assert!(
+                    event["host_key"]
+                        .as_str()
+                        .is_some_and(|key| key.starts_with("ed25519:")),
+                    "host_key is an ed25519:<hex> string"
+                );
+                assert!(
+                    event["slab_id"].is_null() || event["slab_id"].is_string(),
+                    "slab_id is a hex string or null"
+                );
+                assert!(
+                    event["shard_index"].is_u64() && event["bytes"].is_u64(),
+                    "shard_index and bytes are integers"
+                );
+                assert!(event["ts"].is_u64(), "ts is an integer");
+            }
+            let total_bytes: u64 = events
+                .iter()
+                .map(|event| event["bytes"].as_u64().expect("bytes is an integer"))
+                .sum();
+            assert_eq!(value["totals"]["bytes"], Value::from(total_bytes));
+            assert_eq!(value["totals"]["shards"], Value::from(events.len() as u64));
+
+            let mut body = value.clone();
+            body.as_object_mut()
+                .expect("envelope is an object")
+                .remove("signature");
+            let body_bytes = serde_json::to_vec(&body).expect("body serializes");
+            let mut preimage = PREIMAGE_PREFIX.to_vec();
+            preimage.extend_from_slice(&body_bytes);
+            assert_eq!(PREIMAGE_PREFIX, b"tessera-egress-v1:");
+
+            let signature = value["signature"].as_str().expect("signature is a string");
+            assert_eq!(
+                signature,
+                signature.to_lowercase(),
+                "signature must be lowercase hex"
+            );
+            let mut sig = [0u8; 64];
+            hex::decode_to_slice(
+                signature
+                    .strip_prefix("ed25519:")
+                    .expect("signature prefix"),
+                &mut sig,
+            )
+            .expect("signature is 64 bytes of hex");
+            assert!(
+                app_key
+                    .public_key()
+                    .verify(&preimage, &Signature::from(sig)),
+                "the envelope must carry a valid raw Ed25519 signature"
+            );
+            value
+        }
+
+        /// The batch threshold spawns the flusher on the `LocalSet` and
+        /// produces exactly one signed envelope from the recorded events; the
+        /// envelope names the golden identity and satisfies the contract.
+        #[wasm_bindgen_test]
+        async fn test_threshold_flush_produces_signed_envelope() {
+            in_local_set(async {
+                let (reporter, mock) = mock_reporter(Duration::from_secs(3600), 2);
+                let slab_id = Hash256::new([0xAB; 32]);
+                reporter.record(host(1), Some(slab_id), 0, 4096);
+                reporter.record(host(2), None, 3, 1024);
+
+                wait_for_attempts(&mock, 1).await;
+                let attempts = mock.egress_attempts();
+                assert_eq!(
+                    attempts.len(),
+                    1,
+                    "the threshold must emit exactly one envelope"
+                );
+
+                let value = assert_envelope_contract(&attempts[0], &golden_app_key());
+                assert_eq!(
+                    value["identity"],
+                    Value::String(GOLDEN_IDENTITY.to_string()),
+                    "the golden app key must produce the golden identity"
+                );
+                assert_eq!(value["seq"], Value::from(1_u64));
+
+                let events = value["events"].as_array().expect("events");
+                assert_eq!(events.len(), 2);
+                assert_eq!(events[0]["host_key"], Value::String(host(1).to_string()));
+                assert_eq!(events[0]["slab_id"], Value::String(slab_id.to_string()));
+                assert_eq!(events[0]["shard_index"], Value::from(0_u64));
+                assert_eq!(events[0]["bytes"], Value::from(4096_u64));
+                assert_eq!(events[1]["host_key"], Value::String(host(2).to_string()));
+                assert_eq!(events[1]["slab_id"], Value::Null);
+                assert_eq!(events[1]["shard_index"], Value::from(3_u64));
+                assert_eq!(events[1]["bytes"], Value::from(1024_u64));
+                assert_eq!(value["totals"]["bytes"], Value::from(5120_u64));
+
+                // The threshold flush drained the queue: a forced flush has
+                // nothing left to send.
+                reporter.flush_now().await;
+                assert_eq!(
+                    mock.egress_attempts().len(),
+                    1,
+                    "a forced flush after the threshold must not resend"
+                );
+            })
+            .await;
+        }
+
+        /// `flush_now` does not depend on the interval: with a one-hour
+        /// interval a single queued event is delivered only when forced.
+        #[wasm_bindgen_test]
+        async fn test_flush_now_is_deterministic() {
+            in_local_set(async {
+                let (reporter, mock) = mock_reporter(Duration::from_secs(3600), 500);
+                reporter.record(host(7), None, 5, 8192);
+
+                // Give the flusher plenty of scheduler turns: below the
+                // threshold, with the interval an hour away, it must not send.
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    mock.egress_attempts().is_empty(),
+                    "the wall-clock interval must not fire"
+                );
+
+                reporter.flush_now().await;
+                let attempts = mock.egress_attempts();
+                assert_eq!(attempts.len(), 1, "flush_now sends the queued event");
+                let value = assert_envelope_contract(&attempts[0], &golden_app_key());
+                let events = value["events"].as_array().expect("events");
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0]["bytes"], Value::from(8192_u64));
+                assert_eq!(value["totals"]["bytes"], Value::from(8192_u64));
+            })
+            .await;
+        }
+
+        /// The bounded queue drops the oldest event beyond 4096 without
+        /// blocking the recorder.
+        #[wasm_bindgen_test]
+        async fn test_queue_overflow_drops_oldest() {
+            in_local_set(async {
+                let (reporter, _mock) = mock_reporter(Duration::from_secs(3600), 500);
+                for i in 0..QUEUE_CAP + 1 {
+                    reporter.record(host(0), None, i, 1);
+                }
+
+                let queue = reporter.inner.queue.lock().unwrap();
+                assert_eq!(queue.len(), QUEUE_CAP);
+                assert_eq!(reporter.dropped(), 1);
+                assert_eq!(queue.front().unwrap().shard_index, 1);
+                assert_eq!(queue.back().unwrap().shard_index, QUEUE_CAP as u64);
+            })
+            .await;
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]

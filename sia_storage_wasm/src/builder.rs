@@ -1,7 +1,8 @@
 use std::cell::RefCell;
+use std::time::Duration;
 
 use sia_storage::{
-    ApprovedState, Builder as StorageBuilder, DisconnectedState, RequestingApprovalState,
+    ApprovedState, Builder as StorageBuilder, DisconnectedState, RequestingApprovalState, Url,
 };
 use wasm_bindgen::prelude::*;
 
@@ -15,6 +16,32 @@ enum BuilderState {
     RequestingApproval(StorageBuilder<RequestingApprovalState>),
     Approved(StorageBuilder<ApprovedState>),
     Finalized,
+}
+
+/// Applies a consuming egress-config setter to the wrapped storage builder in
+/// whichever connection state it currently holds, keeping the wasm `Builder`'s
+/// state slot populated.
+///
+/// Configuration is only meaningful before `connected()`/`requestConnection()`
+/// /`register()`; a finalized builder returns a JS error.
+macro_rules! configure {
+    ($self:expr, $builder:ident => $apply:expr) => {{
+        let state = $self.state.borrow_mut().take();
+        let next = match state {
+            Some(BuilderState::Disconnected($builder)) => Some(BuilderState::Disconnected($apply)),
+            Some(BuilderState::RequestingApproval($builder)) => {
+                Some(BuilderState::RequestingApproval($apply))
+            }
+            Some(BuilderState::Approved($builder)) => Some(BuilderState::Approved($apply)),
+            Some(BuilderState::Finalized) => {
+                *$self.state.borrow_mut() = Some(BuilderState::Finalized);
+                return Err(JsError::new("builder has already been finalized"));
+            }
+            None => return Err(JsError::new("builder has already been finalized")),
+        };
+        *$self.state.borrow_mut() = next;
+        Ok(())
+    }};
 }
 
 /// SDK Builder — handles the connection and registration flow with an indexer.
@@ -136,5 +163,30 @@ impl Builder {
 
         *self.state.borrow_mut() = next_state;
         result
+    }
+
+    /// Enables signed egress reporting (P3b) and sets the URL served-shard
+    /// batches are POSTed to. Reporting stays disabled until this is set.
+    ///
+    /// The wasm reporter is memory-only (no filesystem spool); see
+    /// `egressIntervalMs` and `egressBatchMax` for batching.
+    #[wasm_bindgen(js_name = "egressUrl")]
+    pub fn egress_url(&self, url: &str) -> Result<(), JsError> {
+        let url = Url::parse(url).map_err(to_js_err)?;
+        configure!(self, builder => builder.egress_url(url))
+    }
+
+    /// Sets how often queued egress events are flushed, in milliseconds.
+    /// Defaults to 30000 (30 seconds); the batch threshold flushes sooner.
+    #[wasm_bindgen(js_name = "egressIntervalMs")]
+    pub fn egress_interval_ms(&self, ms: u32) -> Result<(), JsError> {
+        configure!(self, builder => builder.egress_interval(Duration::from_millis(ms as u64)))
+    }
+
+    /// Sets the maximum number of events per reported egress batch.
+    /// Defaults to 500; values below 1 are treated as 1.
+    #[wasm_bindgen(js_name = "egressBatchMax")]
+    pub fn egress_batch_max(&self, batch_max: u32) -> Result<(), JsError> {
+        configure!(self, builder => builder.egress_batch_max(batch_max as usize))
     }
 }

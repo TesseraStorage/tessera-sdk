@@ -83,7 +83,7 @@ impl MockNetwork {
 
     /// Builds an [`Sdk`] backed by this network that reports served-shard
     /// egress through `egress` (test-only).
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[cfg(test)]
     pub(crate) async fn sdk_with_egress(
         &self,
         app_key: AppKey,
@@ -110,8 +110,10 @@ impl Default for MockNetwork {
 ///
 /// The reporter is a real [`EgressReporter`](crate::EgressReporter), so tests
 /// assert on the canonical signed bodies the mocked endpoint received instead
-/// of reaching into private reporter state.
-#[cfg(all(test, not(target_arch = "wasm32")))]
+/// of reaching into private reporter state. Compiled on native and wasm test
+/// targets; the transport mock itself is
+/// [`app_client::mock::Client`](crate::app_client::mock::Client).
+#[cfg(test)]
 pub(crate) mod capture {
     use std::sync::Arc;
 
@@ -166,16 +168,23 @@ pub(crate) mod capture {
         }
 
         /// Makes the next `times` sends fail with a retryable transport error.
+        #[cfg(not(target_arch = "wasm32"))]
         pub(crate) fn fail_sends(&self, times: usize) {
             self.api.fail_egress_reports(times);
+        }
+
+        /// The raw body of every captured report attempt, in order. Used by
+        /// [`MockEgress::recorded`] and by tests that assert the signed
+        /// envelope contract itself.
+        pub(crate) fn attempts(&self) -> Vec<Vec<u8>> {
+            self.api.egress_attempts()
         }
 
         /// Force-flushes and returns every event the endpoint received, in
         /// order. A retried envelope contributes its events again.
         pub(crate) async fn recorded(&self) -> Vec<RecordedEvent> {
             self.reporter.flush_now().await;
-            self.api
-                .egress_attempts()
+            self.attempts()
                 .iter()
                 .flat_map(|body| decode_events(body))
                 .collect()

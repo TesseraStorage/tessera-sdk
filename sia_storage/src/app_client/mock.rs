@@ -435,7 +435,7 @@ impl Client {
     }
 
     /// Returns the body of every egress report attempt, in order.
-    #[cfg(all(test, not(target_arch = "wasm32")))]
+    #[cfg(test)]
     pub(crate) fn egress_attempts(&self) -> Vec<Vec<u8>> {
         self.state.read().unwrap().egress.attempts.clone()
     }
