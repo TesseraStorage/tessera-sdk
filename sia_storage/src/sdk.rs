@@ -11,6 +11,7 @@ use tokio::io::AsyncRead;
 use url::Url;
 
 use crate::app_client::{self, SlabPinParams};
+use crate::egress::EgressReporter;
 use crate::hosts::Hosts;
 use crate::rhp4::{Client, HostEndpoint};
 use crate::upload::{PackedUpload, upload_object};
@@ -58,6 +59,10 @@ pub struct Sdk {
     // plate; overwritten (not merged) on each new write job, per "lists
     // do not persist across jobs."
     last_write_plate: Arc<std::sync::RwLock<Vec<Host>>>,
+    // P3b egress reporting, if the builder configured an egress URL. The
+    // read path records served shards through it (Task 6).
+    #[allow(dead_code)] // read by the read-path hook
+    egress: Option<Arc<EgressReporter>>,
 }
 
 impl Sdk {
@@ -130,8 +135,9 @@ impl Sdk {
     pub(crate) async fn new(
         api_client: app_client::Client,
         app_key: Arc<AppKey>,
+        egress: Option<Arc<EgressReporter>>,
     ) -> Result<Self, BuilderError> {
-        Self::with_backends(api_client, Client::new(), app_key).await
+        Self::with_backends(api_client, Client::new(), app_key, egress).await
     }
 
     /// Creates a new SDK instance with the provided backends
@@ -144,6 +150,7 @@ impl Sdk {
         api_client: app_client::Client,
         transport: Client,
         app_key: Arc<AppKey>,
+        egress: Option<Arc<EgressReporter>>,
     ) -> Result<Self, BuilderError> {
         let hosts = Hosts::new(transport);
         Ok(Self {
@@ -151,6 +158,7 @@ impl Sdk {
             api_client,
             hosts,
             last_write_plate: Arc::new(std::sync::RwLock::new(Vec::new())),
+            egress,
         })
     }
 
@@ -200,7 +208,13 @@ impl Sdk {
         // start fetches the plate once, in RAM, for this job only (product
         // law). connect() no longer does this -- upload is now the only
         // place a write job's host list gets populated.
-        Self::refresh_hosts(&self.app_key, &self.api_client, &self.hosts, &self.last_write_plate).await?;
+        Self::refresh_hosts(
+            &self.app_key,
+            &self.api_client,
+            &self.hosts,
+            &self.last_write_plate,
+        )
+        .await?;
         upload_object(
             self.hosts.clone(),
             self.app_key.clone(),
@@ -247,7 +261,13 @@ impl Sdk {
     ) -> Result<PackedUpload, UploadError> {
         // TESSERA FORK: same
         // write-start-fetch law as `upload` -- see that method's comment.
-        Self::refresh_hosts(&self.app_key, &self.api_client, &self.hosts, &self.last_write_plate).await?;
+        Self::refresh_hosts(
+            &self.app_key,
+            &self.api_client,
+            &self.hosts,
+            &self.last_write_plate,
+        )
+        .await?;
         PackedUpload::new(self.hosts.clone(), self.app_key.clone(), options)
     }
 
@@ -548,16 +568,24 @@ mod test {
         let app_key = Arc::new(AppKey::import(random_seed()));
         let client = crate::app_client::Client::new(server.url("/").to_string()).unwrap();
 
-        let sdk = Sdk::with_backends(client, crate::rhp4::Client::mock(), app_key)
+        let sdk = Sdk::with_backends(client, crate::rhp4::Client::mock(), app_key, None)
             .await
             .expect("sdk creation failed");
 
         // `connected()`/`with_backends` must not have touched /hosts.
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "connect must not GET /hosts");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "connect must not GET /hosts"
+        );
 
         // No background task exists to fire later, either.
         tokio::time::sleep(crate::time::Duration::from_millis(300)).await;
-        assert_eq!(hits.load(Ordering::SeqCst), 0, "no periodic refresh must fire");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no periodic refresh must fire"
+        );
 
         // sanity: the Sdk still exists and its (empty) host list reflects
         // that nothing was ever populated outside of an explicit job.

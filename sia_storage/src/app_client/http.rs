@@ -9,9 +9,9 @@ use sia_core::signing::PrivateKey;
 use sia_core::types::Hash256;
 
 use super::{
-    AuthConnectStatusResponse, Error, IntoUrl, PinObjectRequest, RegisterAppRequest,
-    RegisterAppResponse, SHARE_URL_FETCH_SCHEME, SHARE_URL_SCHEME, SealedObjectEvent,
-    SharedObjectResponse, SlabPinParams, Url, register_app_sig_hash, sign,
+    AuthConnectStatusResponse, EgressReportError, Error, IntoUrl, PinObjectRequest,
+    RegisterAppRequest, RegisterAppResponse, SHARE_URL_FETCH_SCHEME, SHARE_URL_SCHEME,
+    SealedObjectEvent, SharedObjectResponse, SlabPinParams, Url, register_app_sig_hash, sign,
 };
 use crate::encryption::EncryptionKey;
 use crate::hosts::Host;
@@ -390,6 +390,38 @@ impl Client {
             ..Default::default()
         })
     }
+
+    /// Reports a signed egress batch to `url` (P3b).
+    ///
+    /// The raw canonical envelope bytes are POSTed as `application/json`.
+    /// Transport failures, 429 and 5xx are retryable; other non-success
+    /// statuses are rejected and must not be retried.
+    pub(crate) async fn report_egress(
+        &self,
+        url: &Url,
+        body: &[u8],
+    ) -> Result<(), EgressReportError> {
+        let resp = self
+            .client
+            .post(url.clone())
+            .timeout(Duration::from_secs(15))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|err| EgressReportError::Transport(err.to_string()))?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            return Err(EgressReportError::Retryable(status));
+        }
+        Err(EgressReportError::Rejected(format!(
+            "{status}: {}",
+            resp.text().await.unwrap_or_default()
+        )))
+    }
 }
 
 async fn get_json<D: DeserializeOwned, Q: Serialize + ?Sized>(
@@ -464,7 +496,6 @@ async fn delete(client: &reqwest::Client, url: Url, app_key: &PrivateKey) -> Res
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use base64::engine::general_purpose::URL_SAFE;
-    use base64::prelude::*;
     use chrono::FixedOffset;
     use sia_core::signing::{PublicKey, Signature};
     use sia_core::{hash_256, public_key};

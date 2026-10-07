@@ -76,6 +76,7 @@ impl MockNetwork {
             app_client::Client::Mock(self.api.clone()),
             Client::Mock(self.transport.clone()),
             Arc::new(app_key),
+            None,
         )
         .await
     }

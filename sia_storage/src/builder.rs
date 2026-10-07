@@ -11,9 +11,13 @@ use thiserror::Error;
 use url::Url;
 
 use crate::app_client::{self, Client};
+use crate::egress::EgressConfig;
 use crate::object_encryption::derive;
 use crate::time::Duration;
 use crate::{AppID, AppKey, AppMetadata, Sdk};
+
+#[cfg(feature = "fs")]
+use std::path::PathBuf;
 
 /// The initial state of the SDK builder, before connecting to the indexd service.
 pub struct DisconnectedState;
@@ -38,6 +42,7 @@ pub struct Builder<S> {
     state: S,
     client: Client,
     app_meta: AppMetadata,
+    egress: EgressConfig,
 }
 
 /// Errors that can occur during the SDK building process.
@@ -93,6 +98,7 @@ impl Builder<DisconnectedState> {
             state: DisconnectedState,
             client,
             app_meta,
+            egress: EgressConfig::default(),
         })
     }
 
@@ -108,7 +114,9 @@ impl Builder<DisconnectedState> {
         if !connected {
             return Ok(None);
         }
-        let sdk = Sdk::new(self.client.clone(), Arc::new(app_key.clone())).await?;
+        let app_key = Arc::new(app_key.clone());
+        let egress = self.egress.reporter(self.client.clone(), app_key.clone());
+        let sdk = Sdk::new(self.client.clone(), app_key, egress).await?;
         Ok(Some(sdk))
     }
 
@@ -133,6 +141,7 @@ impl Builder<DisconnectedState> {
                 expiration: resp.expiration,
             },
             client: self.client,
+            egress: self.egress,
         })
     }
 }
@@ -170,6 +179,7 @@ impl Builder<RequestingApprovalState> {
                     },
                     app_meta: self.app_meta,
                     client: self.client,
+                    egress: self.egress,
                 });
             }
             sleep(Duration::from_secs(5)).await;
@@ -194,7 +204,39 @@ impl Builder<ApprovedState> {
                 self.state.register_url.clone(),
             )
             .await?;
-        Sdk::new(self.client, Arc::new(AppKey(private_key))).await
+        let app_key = Arc::new(AppKey(private_key));
+        let egress = self.egress.reporter(self.client.clone(), app_key.clone());
+        Sdk::new(self.client, app_key, egress).await
+    }
+}
+
+impl<S> Builder<S> {
+    /// Sets the URL that signed egress batches are reported to (P3b).
+    ///
+    /// Egress reporting is disabled until this is set.
+    pub fn egress_url(mut self, url: Url) -> Self {
+        self.egress.url = Some(url);
+        self
+    }
+
+    /// Sets how often queued egress events are flushed. Defaults to 30s.
+    pub fn egress_interval(mut self, interval: Duration) -> Self {
+        self.egress.interval = interval;
+        self
+    }
+
+    /// Sets the maximum number of events per reported batch. Defaults to 500.
+    pub fn egress_batch_max(mut self, batch_max: usize) -> Self {
+        self.egress.batch_max = batch_max;
+        self
+    }
+
+    /// Sets the path of the on-disk retry spool. Envelopes that fail to send
+    /// are appended to it and retried before new events.
+    #[cfg(feature = "fs")]
+    pub fn egress_spool_path(mut self, path: PathBuf) -> Self {
+        self.egress.spool_path = Some(path);
+        self
     }
 }
 
@@ -243,5 +285,44 @@ mod test {
         let derived_app_key =
             derive_app_key(MNEMONIC, &APP_ID, &SHARED_SECRET).expect("derivation failed");
         assert_eq!(derived_app_key, expected_app_key);
+    }
+
+    #[test]
+    fn test_egress_config_setters() {
+        let meta = AppMetadata {
+            id: AppID::new([0u8; 32]),
+            name: "test",
+            description: "test",
+            service_url: "https://service.test",
+            logo_url: None,
+            callback_url: None,
+        };
+        let url: Url = "https://egress.test/api/v1/usage/egress".parse().unwrap();
+        let builder = Builder::new("https://sia.test", meta)
+            .expect("builder")
+            .egress_url(url.clone())
+            .egress_interval(Duration::from_secs(5))
+            .egress_batch_max(7);
+        assert_eq!(builder.egress.url.as_ref(), Some(&url));
+        assert_eq!(builder.egress.interval, Duration::from_secs(5));
+        assert_eq!(builder.egress.batch_max, 7);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn test_egress_spool_path_setter() {
+        let meta = AppMetadata {
+            id: AppID::new([0u8; 32]),
+            name: "test",
+            description: "test",
+            service_url: "https://service.test",
+            logo_url: None,
+            callback_url: None,
+        };
+        let spool = std::path::PathBuf::from("/tmp/tessera-egress.spool");
+        let builder = Builder::new("https://sia.test", meta)
+            .expect("builder")
+            .egress_spool_path(spool.clone());
+        assert_eq!(builder.egress.spool_path, Some(spool));
     }
 }

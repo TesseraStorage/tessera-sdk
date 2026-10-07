@@ -54,6 +54,7 @@ mod app_client;
 mod builder;
 mod congestion;
 mod download;
+mod egress;
 mod encryption;
 mod erasure_coding;
 mod hosts;
@@ -90,6 +91,7 @@ pub use builder::{
     ApprovedState, Builder, BuilderError, DisconnectedState, RequestingApprovalState,
 };
 pub use download::{Download, DownloadError};
+pub use egress::EgressReporter;
 pub use encryption::EncryptionKey;
 pub use hosts::{QueueError, RPCError};
 pub use slabs::{

@@ -10,7 +10,8 @@ use sia_core::signing::PrivateKey;
 use sia_core::types::Hash256;
 
 use super::{
-    Error, RegisterAppResponse, SHARE_URL_SCHEME, SealedObjectEvent, SlabPinParams, Url, sign,
+    EgressReportError, Error, RegisterAppResponse, SHARE_URL_SCHEME, SealedObjectEvent,
+    SlabPinParams, Url, sign,
 };
 use crate::encryption::EncryptionKey;
 use crate::hosts::Host;
@@ -36,6 +37,18 @@ struct State {
     objects: HashMap<Hash256, StoredObject>,
     slabs: HashMap<Hash256, PinnedSlab>,
     user_secret: Hash256,
+    egress: EgressState,
+}
+
+/// Captured egress reports and their configured outcomes.
+#[derive(Debug, Default)]
+struct EgressState {
+    /// The body of every egress report attempt, including failed attempts.
+    attempts: Vec<Vec<u8>>,
+    /// The number of upcoming reports that fail with a transport error.
+    transport_failures: usize,
+    /// When set, reports are rejected with a non-retryable error.
+    reject: bool,
 }
 
 /// An in-memory stand-in for the indexer API.
@@ -387,6 +400,44 @@ impl Client {
             slabs: sealed.slabs,
             ..Default::default()
         })
+    }
+
+    /// Captures an egress report and returns the configured outcome (P3b).
+    pub(crate) async fn report_egress(
+        &self,
+        _: &Url,
+        body: &[u8],
+    ) -> Result<(), EgressReportError> {
+        let mut state = self.state.write().unwrap();
+        state.egress.attempts.push(body.to_vec());
+        if state.egress.reject {
+            return Err(EgressReportError::Rejected("mock rejection".into()));
+        }
+        if state.egress.transport_failures > 0 {
+            state.egress.transport_failures -= 1;
+            return Err(EgressReportError::Transport(
+                "mock transport failure".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fails the next `times` egress reports with a transport error.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn fail_egress_reports(&self, times: usize) {
+        self.state.write().unwrap().egress.transport_failures = times;
+    }
+
+    /// Sets whether egress reports are rejected (non-retryable).
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn reject_egress_reports(&self, reject: bool) {
+        self.state.write().unwrap().egress.reject = reject;
+    }
+
+    /// Returns the body of every egress report attempt, in order.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn egress_attempts(&self) -> Vec<Vec<u8>> {
+        self.state.read().unwrap().egress.attempts.clone()
     }
 }
 

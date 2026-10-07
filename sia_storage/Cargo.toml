@@ -72,6 +72,9 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 sia_core_derive = { path = "../sia_core_derive", version = "0.1.2" }
+# Golden egress tests assert the frozen sha256 of the canonical envelope.
+# No default features: keep the `oid`/`const-oid` baggage out of the lock.
+sha2 = { version = "0.11.0", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 criterion = { version = "0.8.2", features = ["async_tokio"] }
