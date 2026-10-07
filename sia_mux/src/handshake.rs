@@ -392,6 +392,7 @@ mod tests {
     use ed25519_dalek::Signer;
     use getrandom::SysRng;
     use getrandom::rand_core::UnwrapErr;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use x25519_dalek::StaticSecret;
 
     use super::*;
