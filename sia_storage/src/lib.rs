@@ -727,6 +727,7 @@ mod test {
             &objects[0],
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -741,6 +742,7 @@ mod test {
             &objects[1],
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -820,6 +822,7 @@ mod test {
             &objects[0],
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -834,6 +837,7 @@ mod test {
             &objects[1],
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -894,6 +898,7 @@ mod test {
             &objects[0],
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -963,6 +968,7 @@ mod test {
             &objects[1],
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -1054,6 +1060,7 @@ mod test {
             &objects[0],
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -1120,6 +1127,7 @@ mod test {
             &objects[0],
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -1169,6 +1177,7 @@ mod test {
             &object,
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -1185,6 +1194,7 @@ mod test {
             &object,
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions {
                 offset: range.start as u64,
                 length: Some((range.end - range.start) as u64),
@@ -1253,6 +1263,7 @@ mod test {
             &object,
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -1335,6 +1346,7 @@ mod test {
                 &object,
                 hosts.clone(),
                 app_key.clone(),
+                None,
                 DownloadOptions {
                     offset,
                     length: Some(length),
@@ -1408,6 +1420,7 @@ mod test {
             &object,
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -1675,7 +1688,7 @@ mod test {
 
         let mut recovered_data = Vec::with_capacity(data_size);
         let mut download =
-            Download::new(&obj, hosts.clone(), app_key.clone(), download_opts).unwrap();
+            Download::new(&obj, hosts.clone(), app_key.clone(), None, download_opts).unwrap();
         copy(&mut download, &mut recovered_data).await.unwrap();
         assert_eq!(data, recovered_data);
 

@@ -60,8 +60,7 @@ pub struct Sdk {
     // do not persist across jobs."
     last_write_plate: Arc<std::sync::RwLock<Vec<Host>>>,
     // P3b egress reporting, if the builder configured an egress URL. The
-    // read path records served shards through it (Task 6).
-    #[allow(dead_code)] // read by the read-path hook
+    // read path records served shards through it.
     egress: Option<Arc<EgressReporter>>,
 }
 
@@ -293,7 +292,13 @@ impl Sdk {
             .await
             .map_err(|e| DownloadError::Custom(format!("map fetch: {e:?}")))?;
         let scoped_hosts = self.hosts.scoped(map_hosts);
-        Download::new(object, scoped_hosts, self.app_key.clone(), options)
+        Download::new(
+            object,
+            scoped_hosts,
+            self.app_key.clone(),
+            self.egress.clone(),
+            options,
+        )
     }
 
     /// Retrieves a list of hosts from the indexer matching the provided query
@@ -590,5 +595,67 @@ mod test {
         // sanity: the Sdk still exists and its (empty) host list reflects
         // that nothing was ever populated outside of an explicit job.
         drop(sdk);
+    }
+
+    /// P3b Task 6: `Sdk::download` passes the SDK's reporter down to the read
+    /// path; every served shard is reported with the object's slab id, host
+    /// and shard index.
+    #[tokio::test]
+    async fn test_download_reports_served_shards() {
+        use std::io::Cursor;
+        use tokio::io::AsyncReadExt;
+
+        use crate::mock::MockNetwork;
+        use crate::mock::capture::MockEgress;
+
+        let network = MockNetwork::new();
+        network.add_hosts(35);
+        let capture = MockEgress::new(crate::time::Duration::from_secs(3600), 100_000);
+        let sdk = network
+            .sdk_with_egress(AppKey::import(random_seed()), capture.reporter())
+            .await
+            .expect("sdk creation failed");
+
+        // 40 KiB spans two chunks of the single slab.
+        let data: Vec<u8> = (0..40_000).map(|i| i as u8).collect();
+        let object = sdk
+            .upload(
+                Object::default(),
+                Cursor::new(data.clone()),
+                UploadOptions::default(),
+            )
+            .await
+            .expect("upload failed");
+        sdk.pin_object(&object).await.expect("pin failed");
+
+        let fetched = sdk.object(&object.id()).await.expect("object fetch failed");
+        let mut reader = sdk
+            .download(&fetched, DownloadOptions::default())
+            .await
+            .expect("download failed");
+        let mut downloaded = Vec::new();
+        reader
+            .read_to_end(&mut downloaded)
+            .await
+            .expect("read failed");
+        assert_eq!(downloaded, data);
+
+        let events = capture.recorded().await;
+        let min_shards = fetched.slabs()[0].min_shards as usize;
+        assert!(
+            events.len() >= 2 * min_shards,
+            "each of the two chunks reports at least {min_shards} served shards, got {}",
+            events.len()
+        );
+        for event in &events {
+            let event_slab = fetched
+                .slabs()
+                .iter()
+                .find(|slab| Some(slab.digest()) == event.slab_id)
+                .expect("event must name a slab of the object");
+            let sector = &event_slab.sectors[event.shard_index as usize];
+            assert_eq!(event.host_key, sector.host_key);
+            assert!(event.bytes > 0, "served shards carry a byte count");
+        }
     }
 }

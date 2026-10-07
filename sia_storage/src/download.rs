@@ -11,7 +11,10 @@ use crate::erasure_coding::{self, ErasureCoder};
 use crate::hosts::{Hosts, InflightGuard, RPCError};
 use crate::slabs::SlabVersion::{V0, V1};
 use crate::time::{Duration, Elapsed, Instant, sleep};
-use crate::{AppKey, DownloadOptions, Object, Sector, ShardProgress, ShardProgressCallback, Slab};
+use crate::{
+    AppKey, DownloadOptions, EgressReporter, Hash256, Object, Sector, ShardProgress,
+    ShardProgressCallback, Slab,
+};
 use bytes::{Buf, Bytes};
 use log::debug;
 use sia_core::rhp4::SEGMENT_SIZE;
@@ -124,6 +127,12 @@ struct SlabRecovery<State> {
     client: Hosts,
     controller: Arc<InflightController>,
     account_key: Arc<AppKey>,
+    /// Identity of the slab whose shards this recovery downloads. `Slab::digest`
+    /// excludes offset and length, so the chunk clone digests to the original
+    /// slab's id.
+    slab_id: Hash256,
+    /// P3b egress reporter, when reporting is configured.
+    egress: Option<Arc<EgressReporter>>,
 
     slab_index: usize,
     min_shards: usize,
@@ -139,6 +148,7 @@ impl SlabRecovery<AwaitingRecovery> {
         client: Hosts,
         controller: Arc<InflightController>,
         account_key: Arc<AppKey>,
+        egress: Option<Arc<EgressReporter>>,
         slab: ChunkSlab,
         seq: usize,
         popped: watch::Sender<usize>,
@@ -192,6 +202,8 @@ impl SlabRecovery<AwaitingRecovery> {
             client,
             controller,
             account_key,
+            slab_id: slab.slab.digest(),
+            egress,
             slab_index: slab.index,
             min_shards,
             encryption_key: slab.slab.encryption_key,
@@ -216,6 +228,8 @@ impl SlabRecovery<AwaitingRecovery> {
         let client = self.client.clone();
         let controller = self.controller.clone();
         let account_key = self.account_key.clone();
+        let egress = self.egress.clone();
+        let slab_id = self.slab_id;
         let slab_index = self.slab_index;
         async move {
             // Hold the inflight reservation for the duration of the RPC. The
@@ -239,6 +253,18 @@ impl SlabRecovery<AwaitingRecovery> {
             let elapsed = start.elapsed();
             controller.record(permit, elapsed, result.is_ok());
             let data = result?;
+            // P3b: report the served bytes immediately after the successful
+            // RPC — before selection/delivery — so overprovisioned and raced
+            // successes each count. Failed RPCs never reach this point.
+            // Reporting never blocks or fails the read.
+            if let Some(egress) = &egress {
+                egress.record(
+                    task.sector.host_key,
+                    Some(slab_id),
+                    task.shard_index,
+                    data.len(),
+                );
+            }
             debug!(
                 "slab {} shard {} recovered from {} in {:?}",
                 slab_index, task.shard_index, task.sector.host_key, elapsed
@@ -312,6 +338,8 @@ impl SlabRecovery<AwaitingRecovery> {
                                     client: self.client,
                                     controller: self.controller,
                                     account_key: self.account_key,
+                                    slab_id: self.slab_id,
+                                    egress: self.egress,
                                     min_shards,
                                     slab_index: self.slab_index,
                                     encryption_key: self.encryption_key,
@@ -373,6 +401,8 @@ impl SlabRecovery<ShardsRecovered> {
             client: self.client,
             controller: self.controller,
             account_key: self.account_key,
+            slab_id: self.slab_id,
+            egress: self.egress,
             min_shards: self.min_shards,
             slab_index: self.slab_index,
             encryption_key: self.encryption_key,
@@ -504,6 +534,9 @@ pub struct Download {
     errored: bool,
 
     shard_downloaded: Option<ShardProgressCallback>,
+
+    /// P3b egress reporter, when reporting is configured.
+    egress: Option<Arc<EgressReporter>>,
 }
 
 impl AsyncRead for Download {
@@ -586,6 +619,7 @@ impl Download {
             hosts,
             self.controller.clone(),
             account_key,
+            self.egress.clone(),
             chunk_slab,
             seq,
             self.popped.clone(),
@@ -655,6 +689,7 @@ impl Download {
         object: &Object,
         hosts: Hosts,
         account_key: Arc<AppKey>,
+        egress: Option<Arc<EgressReporter>>,
         options: DownloadOptions,
     ) -> Result<Self, DownloadError> {
         if options.max_buffered_chunks == Some(0) {
@@ -690,6 +725,7 @@ impl Download {
             popped: watch::channel(0).0,
             errored: false,
             shard_downloaded: options.shard_downloaded,
+            egress,
         };
         download.refill();
         Ok(download)
@@ -760,6 +796,7 @@ mod test {
             &obj,
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -826,6 +863,7 @@ mod test {
             &obj,
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -842,6 +880,7 @@ mod test {
             &obj,
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions {
                 offset: offset as u64,
                 length: Some(length as u64),
@@ -947,6 +986,7 @@ mod test {
             &obj,
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions::default(),
         )
         .unwrap();
@@ -961,6 +1001,7 @@ mod test {
             &obj,
             hosts.clone(),
             app_key.clone(),
+            None,
             DownloadOptions {
                 offset: offset as u64,
                 length: Some(length as u64),
@@ -1042,6 +1083,7 @@ mod test {
                     10,
                 )),
                 app_key.clone(),
+                None,
                 ChunkSlab {
                     slab,
                     index: 0,
@@ -1128,7 +1170,7 @@ mod test {
         });
 
         let mut recovered_data = Vec::with_capacity(data_size);
-        let mut download = Download::new(&obj, hosts.clone(), app_key.clone(), opts).unwrap();
+        let mut download = Download::new(&obj, hosts.clone(), app_key.clone(), None, opts).unwrap();
         tokio::io::copy(&mut download, &mut recovered_data)
             .await
             .unwrap();
@@ -1248,6 +1290,7 @@ mod test {
                 10,
             )),
             app_key.clone(),
+            None,
             racing_chunk(&slab),
             RACE_WINDOW, // first chunk outside the window
             watch::channel(0).0,
@@ -1276,6 +1319,7 @@ mod test {
                 10,
             )),
             app_key.clone(),
+            None,
             racing_chunk(&slab),
             0,
             watch::channel(0).0,
@@ -1313,6 +1357,7 @@ mod test {
                 10,
             )),
             app_key.clone(),
+            None,
             racing_chunk(&slab),
             RACE_WINDOW,
             popped_tx,
@@ -1325,6 +1370,372 @@ mod test {
         assert!(
             elapsed >= Duration::from_millis(190) && elapsed < Duration::from_millis(1200),
             "racing should begin once the chunk enters the window: {elapsed:?}"
+        );
+    }
+
+    /// Mirrors the `SEGMENT_SIZE`-based rounding in
+    /// [`SlabRecovery::recover_shards`]: the aligned `(offset, length)` a
+    /// chunk reads from every sector.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn aligned_region(offset: usize, length: usize, min_shards: usize) -> (usize, usize) {
+        let chunk_size = SEGMENT_SIZE * min_shards;
+        let start = (offset / chunk_size) * SEGMENT_SIZE;
+        let end = (offset + length).div_ceil(chunk_size) * SEGMENT_SIZE;
+        (start, end - start)
+    }
+
+    /// Uploads `data_size` random bytes to 40 mock hosts with the default
+    /// 10-of-30 options and returns the resulting object plus a download
+    /// [`Hosts`] that knows only the hosts of the first ten sectors. Reads
+    /// from the other twenty sectors fail with `UnknownHost`, so exactly ten
+    /// shard RPCs can succeed, deterministically.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn single_slab_with_10_known_hosts(
+        data_size: usize,
+    ) -> (Object, Hosts, Vec<u8>, Arc<AppKey>) {
+        fn host(public_key: crate::PublicKey) -> Host {
+            Host {
+                public_key,
+                addresses: vec![NetAddress {
+                    protocol: sia_core::types::v2::Protocol::QUIC,
+                    address: "localhost:1234".to_string(),
+                }],
+                country_code: "US".to_string(),
+                latitude: 0.0,
+                longitude: 0.0,
+                good_for_upload: true,
+            }
+        }
+
+        let transport = mock::Client::new();
+        let upload_hosts = Hosts::new(Client::Mock(transport.clone()));
+        upload_hosts.update(
+            (0..40)
+                .map(|_| host(PrivateKey::from_seed(&rand::random()).public_key()))
+                .collect(),
+            true,
+        );
+
+        let mut data = BytesMut::zeroed(data_size);
+        rand::rng().fill_bytes(&mut data);
+        let data = data.to_vec();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        let obj = upload_object(
+            upload_hosts,
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.clone()),
+            UploadOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(obj.slabs().len(), 1, "fixture expects a single slab");
+        let slab = &obj.slabs()[0];
+        assert_eq!(slab.sectors.len(), 30, "default options are 10-of-30");
+
+        let data_shards = slab.min_shards as usize;
+        let known: Vec<Host> = slab
+            .sectors
+            .iter()
+            .take(data_shards)
+            .map(|sector| host(sector.host_key))
+            .collect();
+        let download_hosts = Hosts::new(Client::Mock(transport));
+        download_hosts.update(known, true);
+
+        (obj, download_hosts, data, app_key)
+    }
+
+    /// P3b Task 6: one event per successful shard RPC, carrying the host,
+    /// shard index, slab id and served byte count. Failed RPCs (the twenty
+    /// unknown hosts) record nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_download_reports_exactly_served_shards() {
+        use crate::mock::capture::MockEgress;
+
+        let (obj, download_hosts, data, app_key) = single_slab_with_10_known_hosts(8 << 10).await;
+        let slab = obj.slabs()[0].clone();
+
+        let capture = MockEgress::new(Duration::from_secs(3600), 100_000);
+        let mut download = Download::new(
+            &obj,
+            download_hosts,
+            app_key,
+            Some(capture.reporter()),
+            DownloadOptions::default(),
+        )
+        .unwrap();
+        let mut recovered = Vec::new();
+        tokio::io::copy(&mut download, &mut recovered)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered, data,
+            "the download must still deliver the object"
+        );
+
+        let events = capture.recorded().await;
+        let data_shards = slab.min_shards as usize;
+        assert_eq!(
+            events.len(),
+            data_shards,
+            "exactly the successful shard RPCs are reported"
+        );
+
+        let (_, expected_bytes) = aligned_region(0, data.len(), data_shards);
+        for (shard_index, sector) in slab.sectors.iter().take(data_shards).enumerate() {
+            let event = events
+                .iter()
+                .find(|event| event.host_key == sector.host_key)
+                .unwrap_or_else(|| panic!("no event for shard {shard_index}"));
+            assert_eq!(
+                event.slab_id,
+                Some(slab.digest()),
+                "shard {shard_index} must carry the slab id"
+            );
+            assert_eq!(event.shard_index, shard_index as u64);
+            assert_eq!(event.bytes, expected_bytes as u64);
+        }
+    }
+
+    /// P3b Task 6: when a host's read fails it is retried with another of its
+    /// sectors and each successful serve is reported on its own. The failed
+    /// RPCs (`sector not found`) record nothing, so exactly the four served
+    /// shards appear even though six RPCs were attempted.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_retried_host_reports_each_success() {
+        use crate::mock::capture::MockEgress;
+
+        fn host(public_key: crate::PublicKey) -> Host {
+            Host {
+                public_key,
+                addresses: vec![NetAddress {
+                    protocol: sia_core::types::v2::Protocol::QUIC,
+                    address: "localhost:1234".to_string(),
+                }],
+                country_code: "US".to_string(),
+                latitude: 0.0,
+                longitude: 0.0,
+                good_for_upload: true,
+            }
+        }
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport));
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        let host_a = PrivateKey::from_seed(&rand::random()).public_key();
+        let host_b = PrivateKey::from_seed(&rand::random()).public_key();
+        hosts.update(vec![host(host_a), host(host_b)], true);
+
+        // Four of the six sectors exist. Host A's shard 0 and host B's shard 5
+        // are missing, so both hosts fail one RPC and then serve two. The mock
+        // requires full-size (SECTOR_SIZE) sectors; the read region is smaller.
+        let payload = Bytes::from(vec![0u8; SECTOR_SIZE]);
+        let write = |host_key, payload: Bytes| {
+            hosts.write_sector(host_key, &app_key.0, payload, Duration::from_secs(5), None)
+        };
+        let root_a1 = write(host_a, payload.clone()).await.unwrap();
+        let root_a2 = write(host_a, payload.clone()).await.unwrap();
+        let root_b3 = write(host_b, payload.clone()).await.unwrap();
+        let root_b4 = write(host_b, payload).await.unwrap();
+
+        let missing = || Hash256::from(rand::random::<[u8; 32]>());
+        let slab = Slab {
+            version: V0,
+            encryption_key: rand::random::<[u8; 32]>().into(),
+            min_shards: 4,
+            sectors: vec![
+                Sector {
+                    root: missing(),
+                    host_key: host_a,
+                },
+                Sector {
+                    root: root_a1,
+                    host_key: host_a,
+                },
+                Sector {
+                    root: root_a2,
+                    host_key: host_a,
+                },
+                Sector {
+                    root: root_b3,
+                    host_key: host_b,
+                },
+                Sector {
+                    root: root_b4,
+                    host_key: host_b,
+                },
+                Sector {
+                    root: missing(),
+                    host_key: host_b,
+                },
+            ],
+            offset: 0,
+            length: 4096,
+        };
+        let slab_id = slab.digest();
+
+        let capture = MockEgress::new(Duration::from_secs(3600), 100_000);
+        SlabRecovery::new(
+            hosts,
+            Arc::new(InflightController::new(
+                INITIAL_INFLIGHT,
+                MIN_INFLIGHT,
+                100,
+                4,
+            )),
+            app_key,
+            Some(capture.reporter()),
+            ChunkSlab {
+                slab,
+                index: 0,
+                object_offset: 0,
+            },
+            0,
+            watch::channel(0).0,
+        )
+        .unwrap()
+        .recover_shards(None)
+        .await
+        .unwrap();
+
+        let events = capture.recorded().await;
+        let (_, expected_bytes) = aligned_region(0, 4096, 4);
+        assert_eq!(
+            events.len(),
+            4,
+            "only successful RPCs are reported, got {:?}",
+            events
+                .iter()
+                .map(|event| event.shard_index)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.host_key == host_a)
+                .count(),
+            2,
+            "host A is retried after its failed read; each success is reported"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.host_key == host_b)
+                .count(),
+            2,
+            "host B is retried after its failed read; each success is reported"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.shard_index == 0 || event.shard_index == 5),
+            "the failed RPCs must record nothing"
+        );
+        for event in &events {
+            assert_eq!(event.slab_id, Some(slab_id));
+            assert_eq!(event.bytes, expected_bytes as u64);
+        }
+    }
+
+    /// P3b Task 6: a reporter queue at capacity drops the oldest events but
+    /// never blocks or fails the read, and the newly served shards are still
+    /// reported.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_queue_full_does_not_block_reads() {
+        use crate::mock::capture::MockEgress;
+
+        let capture = MockEgress::new(Duration::from_secs(3600), 100_000);
+        let reporter = capture.reporter();
+        // 4097 records overflow the reporter's 4096-event queue.
+        for shard_index in 0..=4096 {
+            reporter.record(crate::PublicKey::new([0u8; 32]), None, shard_index, 1);
+        }
+        assert!(
+            reporter.dropped() >= 1,
+            "the bounded queue must have dropped the oldest event"
+        );
+
+        let (obj, download_hosts, data, app_key) = single_slab_with_10_known_hosts(8 << 10).await;
+        let slab = obj.slabs()[0].clone();
+        let mut download = Download::new(
+            &obj,
+            download_hosts,
+            app_key,
+            Some(reporter),
+            DownloadOptions::default(),
+        )
+        .unwrap();
+        let mut recovered = Vec::new();
+        tokio::io::copy(&mut download, &mut recovered)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered, data,
+            "a full reporter queue must not affect the read"
+        );
+
+        let events = capture.recorded().await;
+        for sector in slab.sectors.iter().take(slab.min_shards as usize) {
+            assert!(
+                events.iter().any(|event| event.host_key == sector.host_key
+                    && event.slab_id == Some(slab.digest())),
+                "the served shards must still be reported after overflow"
+            );
+        }
+    }
+
+    /// P3b Task 6: when every send fails, reads still succeed and the served
+    /// shards are still recorded (delivery remains a background concern).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn test_failed_send_does_not_fail_reads() {
+        use crate::mock::capture::MockEgress;
+
+        // Flush on every event so sends race the reads.
+        let capture = MockEgress::new(Duration::from_millis(1), 1);
+        capture.fail_sends(usize::MAX);
+
+        let (obj, download_hosts, data, app_key) = single_slab_with_10_known_hosts(8 << 10).await;
+        let slab = obj.slabs()[0].clone();
+        let mut download = Download::new(
+            &obj,
+            download_hosts,
+            app_key,
+            Some(capture.reporter()),
+            DownloadOptions::default(),
+        )
+        .unwrap();
+        let mut recovered = Vec::new();
+        tokio::io::copy(&mut download, &mut recovered)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered, data,
+            "a failing egress send must not affect the read"
+        );
+
+        // Force at least one send attempt; the mock endpoint fails it and the
+        // envelope is captured anyway.
+        let events = capture.recorded().await;
+        assert!(
+            !events.is_empty(),
+            "served shards must still be recorded when sends fail"
+        );
+        assert!(
+            events.iter().all(|event| {
+                event.slab_id == Some(slab.digest())
+                    && slab
+                        .sectors
+                        .iter()
+                        .any(|sector| sector.host_key == event.host_key)
+            }),
+            "every captured event must name a served shard of the slab"
         );
     }
 }
