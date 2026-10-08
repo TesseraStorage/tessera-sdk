@@ -16,10 +16,13 @@
 //! background flusher. The flusher builds and signs an envelope when the
 //! queue reaches `egress_batch_max` events, when `egress_interval` elapses,
 //! or (in tests) via [`EgressReporter::flush_now`], and POSTs it to the
-//! configured egress URL. Retryable failures (transport errors, 429 and 5xx)
-//! resend the *identical* signed envelope with exponential backoff; other 4xx
-//! responses drop the batch with a log line. Native builds can configure a
-//! durable spool file behind the `fs` feature.
+//! configured egress URL. Batches are capped at 1000 events and 512 MiB of
+//! cumulative event bytes, the client obligations under the server's wire
+//! limits. Retryable failures (transport errors, 429 and 5xx) resend the
+//! *identical* signed envelope with exponential backoff; other 4xx responses
+//! drop the batch with a log line; a spool line that cannot be removed after
+//! delivery or rejection is retried under the same backoff. Native builds can
+//! configure a durable spool file behind the `fs` feature.
 //!
 //! [`record`]: EgressReporter::record
 
@@ -53,6 +56,14 @@ const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Default `egress_batch_max`.
 const DEFAULT_BATCH_MAX: usize = 500;
+
+/// Maximum events per reported batch. The server rejects batches above 1000
+/// events; the builder clamps `egress_batch_max` to it.
+pub(crate) const MAX_BATCH_EVENTS: usize = 1000;
+
+/// Maximum cumulative event bytes per reported batch. The server rejects
+/// totals above 1 GiB; the client obligation in the wire contract is 512 MiB.
+pub(crate) const MAX_BATCH_BYTES: u64 = 512 << 20;
 
 /// First retry backoff step.
 const RETRY_BASE: Duration = Duration::from_secs(1);
@@ -125,6 +136,8 @@ impl EgressConfig {
             self.batch_max,
             #[cfg(feature = "fs")]
             spool_path,
+            #[cfg(feature = "fs")]
+            None,
         )))
     }
 }
@@ -136,7 +149,8 @@ enum FlushOutcome {
     Sent,
     /// The endpoint rejected the batch; it was dropped.
     Dropped,
-    /// A retryable failure occurred; the envelope was re-queued.
+    /// A retryable failure occurred or a delivered envelope could not leave
+    /// the spool; the envelope stays recorded for a paced retry.
     Retryable,
     /// Nothing was ready to send.
     Idle,
@@ -152,17 +166,47 @@ enum Source {
     Spool,
 }
 
+/// The injected spool-writer function type.
+#[cfg(feature = "fs")]
+type SpoolWriteFn = dyn Fn(&std::path::Path, &[u8]) -> std::io::Result<()> + Send + Sync;
+
+/// Overrides the spool writer so tests can inject write failures. Production
+/// spools through `tokio::fs::write`; mirrors the Go SDK's `writeSpoolFile`
+/// seam.
+#[cfg(feature = "fs")]
+#[derive(Clone)]
+pub(crate) struct SpoolWriter(Arc<SpoolWriteFn>);
+
+#[cfg(feature = "fs")]
+impl std::fmt::Debug for SpoolWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpoolWriter")
+    }
+}
+
+#[cfg(all(test, feature = "fs"))]
+impl SpoolWriter {
+    /// Wraps a writer override (test seam).
+    pub(crate) fn new(
+        write: impl Fn(&std::path::Path, &[u8]) -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(write))
+    }
+}
+
 /// A bounded JSON-lines spool of signed envelopes awaiting delivery.
 #[cfg(feature = "fs")]
 #[derive(Debug, Clone)]
 struct Spool {
     path: PathBuf,
+    /// Test-injectable writer override; `None` writes with `tokio::fs`.
+    writer: Option<SpoolWriter>,
 }
 
 #[cfg(feature = "fs")]
 impl Spool {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
+    fn new(path: PathBuf, writer: Option<SpoolWriter>) -> Self {
+        Self { path, writer }
     }
 
     /// Reads the spool, returning one line per envelope. Empty lines are
@@ -192,21 +236,25 @@ impl Spool {
     }
 
     /// Removes the oldest spooled envelope after it was delivered or dropped.
-    async fn remove_first(&self) {
+    /// Returns an error when the rewrite fails, leaving the envelope recorded
+    /// on disk: the caller must keep it scheduled for a paced retry.
+    async fn remove_first(&self) -> std::io::Result<()> {
         let mut lines = match self.read_lines().await {
             Ok(lines) => lines,
             Err(err) => {
                 warn!("egress spool read failed ({}): {err}", self.path.display());
-                return;
+                return Err(err);
             }
         };
         if lines.is_empty() {
-            return;
+            return Ok(());
         }
         lines.remove(0);
         if let Err(err) = self.write_lines(&lines).await {
             warn!("egress spool write failed ({}): {err}", self.path.display());
+            return Err(err);
         }
+        Ok(())
     }
 
     /// Appends an envelope, dropping the oldest lines beyond the cap.
@@ -221,14 +269,17 @@ impl Spool {
         self.write_lines(&lines).await
     }
 
-    /// Rewrites the spool as JSON lines.
+    /// Rewrites the spool as JSON lines, through the test seam when set.
     async fn write_lines(&self, lines: &[Vec<u8>]) -> std::io::Result<()> {
         let mut data = Vec::new();
         for line in lines {
             data.extend_from_slice(line);
             data.push(b'\n');
         }
-        tokio::fs::write(&self.path, data).await
+        match &self.writer {
+            Some(writer) => writer.0(&self.path, &data),
+            None => tokio::fs::write(&self.path, data).await,
+        }
     }
 }
 
@@ -283,6 +334,7 @@ impl EgressReporter {
         interval: Duration,
         batch_max: usize,
         #[cfg(feature = "fs")] spool_path: Option<PathBuf>,
+        #[cfg(feature = "fs")] spool_writer: Option<SpoolWriter>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -290,7 +342,7 @@ impl EgressReporter {
                 app_key,
                 url,
                 interval,
-                batch_max: batch_max.max(1),
+                batch_max: batch_max.clamp(1, MAX_BATCH_EVENTS),
                 queue: Mutex::new(VecDeque::new()),
                 pending: Mutex::new(None),
                 retry_at: Mutex::new(None),
@@ -302,7 +354,7 @@ impl EgressReporter {
                 flush_lock: AsyncMutex::new(()),
                 wake: Notify::new(),
                 #[cfg(feature = "fs")]
-                spool: spool_path.map(Spool::new),
+                spool: spool_path.map(|path| Spool::new(path, spool_writer)),
             }),
         }
     }
@@ -368,11 +420,23 @@ impl Inner {
         self.queue.lock().unwrap().len()
     }
 
-    /// Removes up to `batch_max` events from the queue.
+    /// Removes up to `batch_max` events from the queue, stopping before an
+    /// event that would push the cumulative bytes past [`MAX_BATCH_BYTES`],
+    /// the client obligation in the wire contract. Always takes at least one
+    /// event when the queue is non-empty: the server rejects empty batches.
     fn take_events(&self) -> Vec<Event> {
         let mut queue = self.queue.lock().unwrap();
         let count = queue.len().min(self.batch_max);
-        queue.drain(..count).collect()
+        let mut total: u64 = 0;
+        let mut take = 0;
+        for event in queue.iter().take(count) {
+            if take > 0 && total.saturating_add(event.bytes) > MAX_BATCH_BYTES {
+                break;
+            }
+            total = total.saturating_add(event.bytes);
+            take += 1;
+        }
+        queue.drain(..take).collect()
     }
 
     /// The earliest instant the pending envelope or spool may be retried.
@@ -432,28 +496,45 @@ impl Inner {
         self.send(envelope.bytes, Source::Memory).await
     }
 
-    /// Sends one envelope and applies the retry/drop policy.
+    /// Sends one envelope and applies the retry/drop policy. A spooled
+    /// envelope must actually leave the spool before the reporter clears its
+    /// retry state: when the removal rewrite fails, the envelope stays
+    /// recorded and the normal backoff is armed, so the next attempt is paced
+    /// instead of re-posting the same line in a hot loop (the resend is
+    /// idempotent by `batch_id`).
     async fn send(&self, bytes: Vec<u8>, source: Source) -> FlushOutcome {
         match self.client.report_egress(&self.url, &bytes).await {
             Ok(()) => {
-                self.clear_retry();
                 #[cfg(feature = "fs")]
                 if let Source::Spool = source
                     && let Some(spool) = &self.spool
+                    && let Err(err) = spool.remove_first().await
                 {
-                    spool.remove_first().await;
+                    warn!(
+                        "egress spool removal failed ({}): {err}; retrying under backoff",
+                        spool.path.display()
+                    );
+                    self.schedule_retry();
+                    return FlushOutcome::Retryable;
                 }
+                self.clear_retry();
                 FlushOutcome::Sent
             }
             Err(app_client::EgressReportError::Rejected(reason)) => {
                 warn!("egress reporter: batch rejected, dropping: {reason}");
-                self.clear_retry();
                 #[cfg(feature = "fs")]
                 if let Source::Spool = source
                     && let Some(spool) = &self.spool
+                    && let Err(err) = spool.remove_first().await
                 {
-                    spool.remove_first().await;
+                    warn!(
+                        "egress spool removal failed ({}): {err}; retrying under backoff",
+                        spool.path.display()
+                    );
+                    self.schedule_retry();
+                    return FlushOutcome::Retryable;
                 }
+                self.clear_retry();
                 FlushOutcome::Dropped
             }
             Err(err) => {
@@ -840,6 +921,8 @@ mod test {
                 batch_max,
                 #[cfg(feature = "fs")]
                 None,
+                #[cfg(feature = "fs")]
+                None,
             );
             (reporter, mock)
         }
@@ -1062,7 +1145,7 @@ mod test {
             let url: Url = TEST_URL.parse().expect("test url");
             #[cfg(feature = "fs")]
             {
-                EgressReporter::new(client, app_key, url, interval, batch_max, None)
+                EgressReporter::new(client, app_key, url, interval, batch_max, None, None)
             }
             #[cfg(not(feature = "fs"))]
             {
@@ -1326,6 +1409,8 @@ mod test {
                 500,
                 #[cfg(feature = "fs")]
                 None,
+                #[cfg(feature = "fs")]
+                None,
             );
             reporter.record(host(1), None, 0, 4096);
             reporter.flush_now().await;
@@ -1423,6 +1508,7 @@ mod test {
                 Duration::from_secs(3600),
                 500,
                 Some(spool_path.clone()),
+                None,
             );
             mock.fail_egress_reports(1);
 
@@ -1461,6 +1547,167 @@ mod test {
                 tokio::fs::read(&spool_path).await.unwrap().is_empty(),
                 "a drained spool must be empty"
             );
+        }
+
+        /// A byte-heavy queue yields an envelope with at least one event and
+        /// at most [`MAX_BATCH_BYTES`] cumulative event bytes: the server's
+        /// `validate_batch` accepts it. The batch size is also clamped to the
+        /// 1000-event server limit.
+        #[tokio::test]
+        async fn test_take_events_stops_at_client_byte_cap() {
+            let (reporter, mock) = mock_reporter(Duration::from_secs(3600), 5000);
+            assert_eq!(reporter.inner.batch_max, MAX_BATCH_EVENTS);
+
+            for i in 0..6 {
+                reporter.record(host(i as u8), None, i, (MAX_BATCH_BYTES / 4) as usize);
+            }
+            reporter.flush_now().await;
+
+            let attempts = mock.egress_attempts();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "six 128 MiB events form a capped batch and a remainder"
+            );
+            let value = value_of(&attempts[0]);
+            let events = value["events"].as_array().expect("events is an array");
+            assert_eq!(events.len(), 4, "512 MiB at 128 MiB per event");
+            assert!(
+                !events.is_empty() && events.len() <= MAX_BATCH_EVENTS,
+                "events count must satisfy the server's shape: at least 1, at most {MAX_BATCH_EVENTS}"
+            );
+            let total: u64 = events
+                .iter()
+                .map(|event| event["bytes"].as_u64().expect("bytes is an integer"))
+                .sum();
+            assert_eq!(total, MAX_BATCH_BYTES);
+            assert_eq!(value["totals"]["bytes"], Value::from(MAX_BATCH_BYTES));
+        }
+
+        /// A delivered or 4xx-rejected spooled envelope whose removal rewrite
+        /// fails stays recorded and arms the normal backoff: the flusher does
+        /// not re-post it in a hot loop. Once the disk recovers and the
+        /// deadline elapses, the envelope drains normally.
+        #[cfg(feature = "fs")]
+        #[tokio::test]
+        async fn test_spool_removal_failure_is_paced() {
+            for (case, reject) in [("delivered", false), ("rejected-4xx", true)] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let spool_path = dir.path().join("egress.spool");
+
+                let mock = mock::Client::new();
+                if reject {
+                    mock.reject_egress_reports(true);
+                }
+
+                let fail_writes = Arc::new(AtomicBool::new(false));
+                let writes = Arc::new(AtomicUsize::new(0));
+                let writer = {
+                    let fail_writes = fail_writes.clone();
+                    let writes = writes.clone();
+                    SpoolWriter::new(move |path, data| {
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        if fail_writes.load(Ordering::SeqCst) {
+                            return Err(std::io::Error::other("injected spool write failure"));
+                        }
+                        std::fs::write(path, data)
+                    })
+                };
+                let reporter = EgressReporter::new(
+                    app_client::Client::Mock(mock.clone()),
+                    Arc::new(AppKey::import([0x42; 32])),
+                    TEST_URL.parse().unwrap(),
+                    Duration::from_secs(3600),
+                    500,
+                    Some(spool_path.clone()),
+                    Some(writer),
+                );
+
+                let envelope =
+                    br#"{"batch_id":"0123456789abcdef0123456789abcdef"}"#.to_vec();
+                reporter
+                    .inner
+                    .spool
+                    .as_ref()
+                    .expect("spool configured")
+                    .append(&envelope)
+                    .await
+                    .expect("seeding the spool");
+                assert_eq!(writes.load(Ordering::SeqCst), 1, "{case}: seed write");
+
+                // The seed append succeeds; the removal rewrite fails.
+                fail_writes.store(true, Ordering::SeqCst);
+                let outcome = reporter.inner.flush_attempt(false).await;
+                assert_eq!(
+                    outcome,
+                    FlushOutcome::Retryable,
+                    "{case}: a failed removal must keep the envelope for a paced retry"
+                );
+                let attempts = mock.egress_attempts();
+                assert_eq!(attempts.len(), 1, "{case}: exactly one POST");
+                assert_eq!(attempts[0], envelope, "{case}: the spooled envelope was sent");
+                assert_eq!(
+                    writes.load(Ordering::SeqCst),
+                    2,
+                    "{case}: seed + failed removal attempt"
+                );
+                assert!(
+                    reporter
+                        .inner
+                        .retry_at()
+                        .is_some_and(|at| at > Instant::now()),
+                    "{case}: a future retry deadline must be armed after a failed removal"
+                );
+
+                // An immediate (non-forced) pass honors the deadline and does
+                // not re-post: a paced wait, not zero, prevents the hot loop.
+                let idle = reporter.inner.flush_attempt(false).await;
+                assert_eq!(idle, FlushOutcome::Idle, "{case}: gated by the backoff");
+                assert_eq!(
+                    mock.egress_attempts().len(),
+                    1,
+                    "{case}: no re-send during the backoff window"
+                );
+                let wait = reporter.inner.next_wait(Instant::now());
+                assert!(
+                    wait >= RETRY_BASE / 2,
+                    "{case}: next wait {wait:?} must be backoff-scale, not zero"
+                );
+                let spool = reporter.inner.spool.as_ref().expect("spool configured");
+                let lines = spool.read_lines().await.expect("reading the spool");
+                assert_eq!(lines.len(), 1, "{case}: the envelope is still recorded");
+                assert_eq!(lines[0], envelope, "{case}: the unremoved line is intact");
+
+                // The disk recovers and the deadline elapses (rewound rather
+                // than sleeping through the backoff).
+                fail_writes.store(false, Ordering::SeqCst);
+                if reject {
+                    mock.reject_egress_reports(false);
+                }
+                *reporter.inner.retry_at.lock().unwrap() =
+                    Some(Instant::now() - Duration::from_millis(1));
+
+                let outcome = reporter.inner.flush_attempt(false).await;
+                assert_eq!(outcome, FlushOutcome::Sent, "{case}: recovery delivers");
+                assert_eq!(
+                    mock.egress_attempts().len(),
+                    2,
+                    "{case}: the retained envelope is re-posted after recovery"
+                );
+                assert_eq!(
+                    writes.load(Ordering::SeqCst),
+                    3,
+                    "{case}: recovery removal write"
+                );
+                assert!(
+                    reporter.inner.retry_at().is_none(),
+                    "{case}: the retry is cleared once the spool line is removed"
+                );
+                assert!(
+                    spool.read_lines().await.expect("reading the spool").is_empty(),
+                    "{case}: the spool is drained"
+                );
+            }
         }
     }
 }

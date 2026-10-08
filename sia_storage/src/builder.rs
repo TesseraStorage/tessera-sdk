@@ -11,7 +11,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::app_client::{self, Client};
-use crate::egress::EgressConfig;
+use crate::egress::{EgressConfig, MAX_BATCH_EVENTS};
 use crate::object_encryption::derive;
 use crate::time::Duration;
 use crate::{AppID, AppKey, AppMetadata, Sdk};
@@ -226,8 +226,10 @@ impl<S> Builder<S> {
     }
 
     /// Sets the maximum number of events per reported batch. Defaults to 500.
+    /// Values above 1000 are clamped to 1000, the server's per-batch event
+    /// limit.
     pub fn egress_batch_max(mut self, batch_max: usize) -> Self {
-        self.egress.batch_max = batch_max;
+        self.egress.batch_max = batch_max.min(MAX_BATCH_EVENTS);
         self
     }
 
@@ -306,6 +308,25 @@ mod test {
         assert_eq!(builder.egress.url.as_ref(), Some(&url));
         assert_eq!(builder.egress.interval, Duration::from_secs(5));
         assert_eq!(builder.egress.batch_max, 7);
+    }
+
+    /// The server rejects batches above 1000 events, so the builder clamps
+    /// `egress_batch_max` to that limit.
+    #[test]
+    fn test_egress_batch_max_is_clamped() {
+        let meta = AppMetadata {
+            id: AppID::new([0u8; 32]),
+            name: "test",
+            description: "test",
+            service_url: "https://service.test",
+            logo_url: None,
+            callback_url: None,
+        };
+        let builder = Builder::new("https://sia.test", meta)
+            .expect("builder")
+            .egress_batch_max(5000);
+        assert_eq!(builder.egress.batch_max, crate::egress::MAX_BATCH_EVENTS);
+        assert!(builder.egress.batch_max <= 1000);
     }
 
     #[cfg(feature = "fs")]

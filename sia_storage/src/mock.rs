@@ -158,6 +158,8 @@ pub(crate) mod capture {
                 batch_max,
                 #[cfg(feature = "fs")]
                 None,
+                #[cfg(feature = "fs")]
+                None,
             ));
             Self { api, reporter }
         }

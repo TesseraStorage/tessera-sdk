@@ -81,7 +81,7 @@ let sdk = Builder::new("https://sia.storage", APP_META)?
     .await?;
 ```
 
-- `egress_url` enables reporting. `egress_interval` bounds how long a queued event waits before it is flushed, and `egress_batch_max` flushes immediately once that many events are queued.
+- `egress_url` enables reporting. `egress_interval` bounds how long a queued event waits before it is flushed, and `egress_batch_max` flushes immediately once that many events are queued. `egress_batch_max` values above 1000 are clamped to 1000, the server's per-batch event limit; a batch also stops taking events once its cumulative bytes reach 512 MiB, well under the server's 1 GiB cap.
 - Recording is a cheap queue append: reads never block on the reporter and a failed report never fails a read. The queue is bounded (oldest events dropped); failed sends retry the identical signed envelope with exponential backoff, and non-retryable 4xx responses are dropped with a log line.
 - `egress_spool_path` (behind the `fs` feature) persists signed envelopes that could not be delivered so they are retried after a restart. The spool is bounded at 8 MiB, oldest envelopes dropped.
 
