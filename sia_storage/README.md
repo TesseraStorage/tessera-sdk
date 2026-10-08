@@ -65,6 +65,28 @@ tokio::io::copy(&mut reader, &mut writer).await?;
 
 The `AppKey` grants full access to a user's data. After connecting, retrieve it with `SDK::app_key()`, then persist it using `AppKey::export()` and restore it with `AppKey::import()` so users don't need to re-approve on every launch.
 
+## Egress reporting
+
+Downloads can report served-shard egress to a Tessera moneyd endpoint so the account's usage and allowance are metered server-side. Reporting is opt-in and stays disabled until a URL is configured; without it nothing is recorded.
+
+```rust
+use std::time::Duration;
+
+let sdk = Builder::new("https://sia.storage", APP_META)?
+    .egress_url("https://tessera.storage/api/v1/usage/egress".parse()?)
+    .egress_interval(Duration::from_secs(30)) // default: how long an event may wait
+    .egress_batch_max(500)                    // default: events per batch
+    .egress_spool_path("/var/lib/myapp/egress.spool".into()) // `fs` feature only
+    .register("twelve word recovery phrase goes here ...")
+    .await?;
+```
+
+- `egress_url` enables reporting. `egress_interval` bounds how long a queued event waits before it is flushed, and `egress_batch_max` flushes immediately once that many events are queued.
+- Recording is a cheap queue append: reads never block on the reporter and a failed report never fails a read. The queue is bounded (oldest events dropped); failed sends retry the identical signed envelope with exponential backoff, and non-retryable 4xx responses are dropped with a log line.
+- `egress_spool_path` (behind the `fs` feature) persists signed envelopes that could not be delivered so they are retried after a restart. The spool is bounded at 8 MiB, oldest envelopes dropped.
+
+Batches are signed with the account's app key and must match the frozen cross-language wire contract (canonical compact JSON, `tessera-egress-v1:` Ed25519 preimage, `ed25519:<hex>` identity/signature); see `docs/egress-wire-golden.md` in the moneyd repo.
+
 ## Building for WebAssembly
 
 For best performance in the browser, enable the `simd128` target feature:
