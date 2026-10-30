@@ -54,7 +54,6 @@ mod app_client;
 mod builder;
 mod congestion;
 mod download;
-mod egress;
 mod encryption;
 mod erasure_coding;
 mod hosts;
@@ -91,7 +90,6 @@ pub use builder::{
     ApprovedState, Builder, BuilderError, DisconnectedState, RequestingApprovalState,
 };
 pub use download::{Download, DownloadError};
-pub use egress::EgressReporter;
 pub use encryption::EncryptionKey;
 pub use hosts::{QueueError, RPCError};
 pub use slabs::{
@@ -727,9 +725,7 @@ mod test {
             &objects[0],
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -742,9 +738,7 @@ mod test {
             &objects[1],
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -822,9 +816,7 @@ mod test {
             &objects[0],
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -837,9 +829,7 @@ mod test {
             &objects[1],
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -898,9 +888,7 @@ mod test {
             &objects[0],
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -968,9 +956,7 @@ mod test {
             &objects[1],
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -1060,9 +1046,7 @@ mod test {
             &objects[0],
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -1127,9 +1111,7 @@ mod test {
             &objects[0],
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -1177,9 +1159,7 @@ mod test {
             &object,
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
 
         copy(&mut download, &mut Cursor::new(&mut output[..]))
@@ -1194,13 +1174,11 @@ mod test {
             &object,
             hosts.clone(),
             app_key.clone(),
-            None,
             DownloadOptions {
                 offset: range.start as u64,
                 length: Some((range.end - range.start) as u64),
                 ..Default::default()
-            },
-        )
+            })
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -1263,9 +1241,7 @@ mod test {
             &object,
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -1346,13 +1322,11 @@ mod test {
                 &object,
                 hosts.clone(),
                 app_key.clone(),
-                None,
                 DownloadOptions {
                     offset,
                     length: Some(length),
                     ..Default::default()
-                },
-            )
+                })
             .unwrap();
             copy(&mut download, &mut output).await.unwrap();
 
@@ -1420,9 +1394,7 @@ mod test {
             &object,
             hosts.clone(),
             app_key.clone(),
-            None,
-            DownloadOptions::default(),
-        )
+            DownloadOptions::default())
         .unwrap();
         copy(&mut download, &mut Cursor::new(&mut output[..]))
             .await
@@ -1688,7 +1660,7 @@ mod test {
 
         let mut recovered_data = Vec::with_capacity(data_size);
         let mut download =
-            Download::new(&obj, hosts.clone(), app_key.clone(), None, download_opts).unwrap();
+            Download::new(&obj, hosts.clone(), app_key.clone(), download_opts).unwrap();
         copy(&mut download, &mut recovered_data).await.unwrap();
         assert_eq!(data, recovered_data);
 

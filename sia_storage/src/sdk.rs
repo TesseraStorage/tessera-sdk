@@ -11,7 +11,6 @@ use tokio::io::AsyncRead;
 use url::Url;
 
 use crate::app_client::{self, SlabPinParams};
-use crate::egress::EgressReporter;
 use crate::hosts::Hosts;
 use crate::rhp4::{Client, HostEndpoint};
 use crate::upload::{PackedUpload, upload_object};
@@ -59,9 +58,6 @@ pub struct Sdk {
     // plate; overwritten (not merged) on each new write job, per "lists
     // do not persist across jobs."
     last_write_plate: Arc<std::sync::RwLock<Vec<Host>>>,
-    // P3b egress reporting, if the builder configured an egress URL. The
-    // read path records served shards through it.
-    egress: Option<Arc<EgressReporter>>,
 }
 
 impl Sdk {
@@ -134,9 +130,8 @@ impl Sdk {
     pub(crate) async fn new(
         api_client: app_client::Client,
         app_key: Arc<AppKey>,
-        egress: Option<Arc<EgressReporter>>,
     ) -> Result<Self, BuilderError> {
-        Self::with_backends(api_client, Client::new(), app_key, egress).await
+        Self::with_backends(api_client, Client::new(), app_key).await
     }
 
     /// Creates a new SDK instance with the provided backends
@@ -149,7 +144,6 @@ impl Sdk {
         api_client: app_client::Client,
         transport: Client,
         app_key: Arc<AppKey>,
-        egress: Option<Arc<EgressReporter>>,
     ) -> Result<Self, BuilderError> {
         let hosts = Hosts::new(transport);
         Ok(Self {
@@ -157,7 +151,6 @@ impl Sdk {
             api_client,
             hosts,
             last_write_plate: Arc::new(std::sync::RwLock::new(Vec::new())),
-            egress,
         })
     }
 
@@ -292,13 +285,7 @@ impl Sdk {
             .await
             .map_err(|e| DownloadError::Custom(format!("map fetch: {e:?}")))?;
         let scoped_hosts = self.hosts.scoped(map_hosts);
-        Download::new(
-            object,
-            scoped_hosts,
-            self.app_key.clone(),
-            self.egress.clone(),
-            options,
-        )
+        Download::new(object, scoped_hosts, self.app_key.clone(), options)
     }
 
     /// Retrieves a list of hosts from the indexer matching the provided query
@@ -573,7 +560,7 @@ mod test {
         let app_key = Arc::new(AppKey::import(random_seed()));
         let client = crate::app_client::Client::new(server.url("/").to_string()).unwrap();
 
-        let sdk = Sdk::with_backends(client, crate::rhp4::Client::mock(), app_key, None)
+        let sdk = Sdk::with_backends(client, crate::rhp4::Client::mock(), app_key)
             .await
             .expect("sdk creation failed");
 
@@ -595,200 +582,5 @@ mod test {
         // sanity: the Sdk still exists and its (empty) host list reflects
         // that nothing was ever populated outside of an explicit job.
         drop(sdk);
-    }
-
-    /// P3b Task 6: `Sdk::download` passes the SDK's reporter down to the read
-    /// path; every served shard is reported with the object's slab id, host
-    /// and shard index.
-    #[tokio::test]
-    async fn test_download_reports_served_shards() {
-        use std::io::Cursor;
-        use tokio::io::AsyncReadExt;
-
-        use crate::mock::MockNetwork;
-        use crate::mock::capture::MockEgress;
-
-        let network = MockNetwork::new();
-        network.add_hosts(35);
-        let capture = MockEgress::new(crate::time::Duration::from_secs(3600), 100_000);
-        let sdk = network
-            .sdk_with_egress(AppKey::import(random_seed()), capture.reporter())
-            .await
-            .expect("sdk creation failed");
-
-        // 40 KiB spans two chunks of the single slab.
-        let data: Vec<u8> = (0..40_000).map(|i| i as u8).collect();
-        let object = sdk
-            .upload(
-                Object::default(),
-                Cursor::new(data.clone()),
-                UploadOptions::default(),
-            )
-            .await
-            .expect("upload failed");
-        sdk.pin_object(&object).await.expect("pin failed");
-
-        let fetched = sdk.object(&object.id()).await.expect("object fetch failed");
-        let mut reader = sdk
-            .download(&fetched, DownloadOptions::default())
-            .await
-            .expect("download failed");
-        let mut downloaded = Vec::new();
-        reader
-            .read_to_end(&mut downloaded)
-            .await
-            .expect("read failed");
-        assert_eq!(downloaded, data);
-
-        let events = capture.recorded().await;
-        let min_shards = fetched.slabs()[0].min_shards as usize;
-        assert!(
-            events.len() >= 2 * min_shards,
-            "each of the two chunks reports at least {min_shards} served shards, got {}",
-            events.len()
-        );
-        for event in &events {
-            let event_slab = fetched
-                .slabs()
-                .iter()
-                .find(|slab| Some(slab.digest()) == event.slab_id)
-                .expect("event must name a slab of the object");
-            let sector = &event_slab.sectors[event.shard_index as usize];
-            assert_eq!(event.host_key, sector.host_key);
-            assert!(event.bytes > 0, "served shards carry a byte count");
-        }
-    }
-}
-
-/// Wasm equivalent of [`test_download_reports_served_shards`]: the served
-/// shards recorded by the read path are flushed as signed envelopes.
-///
-/// The reporter and the upload/download jobs spawn through `maybe_spawn!`
-/// (`tokio::task::spawn_local` on wasm), so the test enters a current-thread
-/// runtime and a `LocalSet` explicitly. The flush is forced (`flush_now`); no
-/// wall-clock interval is involved and the mock indexer/transport keep it off
-/// the network.
-#[cfg(all(test, target_arch = "wasm32"))]
-mod wasm_test {
-    use super::*;
-    use sia_core::signing::{PublicKey, Signature};
-    use wasm_bindgen_test::*;
-
-    /// Runs `future` on a fresh current-thread runtime with the runtime
-    /// and a `LocalSet` entered, then drives the `LocalSet` to completion.
-    async fn in_local_set<F: std::future::Future>(future: F) -> F::Output {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("creating a tokio runtime must succeed on wasm");
-        let local = tokio::task::LocalSet::new();
-        let output = {
-            let _runtime_guard = runtime.enter();
-            local.run_until(future).await
-        };
-        drop(local);
-        drop(runtime);
-        output
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_download_reports_served_shards_as_signed_envelope() {
-        in_local_set(async {
-            use std::io::Cursor;
-            use tokio::io::AsyncReadExt;
-
-            use crate::mock::MockNetwork;
-            use crate::mock::capture::MockEgress;
-
-            let network = MockNetwork::new();
-            network.add_hosts(35);
-            let capture = MockEgress::new(crate::time::Duration::from_secs(3600), 100_000);
-            let sdk = network
-                .sdk_with_egress(AppKey::import([0x33; 32]), capture.reporter())
-                .await
-                .expect("sdk creation failed");
-
-            // 40 KiB spans two chunks of the single slab.
-            let data: Vec<u8> = (0..40_000).map(|i| i as u8).collect();
-            let object = sdk
-                .upload(
-                    Object::default(),
-                    Cursor::new(data.clone()),
-                    UploadOptions::default(),
-                )
-                .await
-                .expect("upload failed");
-            sdk.pin_object(&object).await.expect("pin failed");
-
-            let fetched = sdk.object(&object.id()).await.expect("object fetch failed");
-            let mut reader = sdk
-                .download(&fetched, DownloadOptions::default())
-                .await
-                .expect("download failed");
-            let mut downloaded = Vec::new();
-            reader
-                .read_to_end(&mut downloaded)
-                .await
-                .expect("read failed");
-            assert_eq!(downloaded, data);
-
-            let events = capture.recorded().await;
-            let min_shards = fetched.slabs()[0].min_shards as usize;
-            assert!(
-                events.len() >= 2 * min_shards,
-                "each of the two chunks reports at least {min_shards} served shards, got {}",
-                events.len()
-            );
-            for event in &events {
-                let event_slab = fetched
-                    .slabs()
-                    .iter()
-                    .find(|slab| Some(slab.digest()) == event.slab_id)
-                    .expect("event must name a slab of the object");
-                let sector = &event_slab.sectors[event.shard_index as usize];
-                assert_eq!(event.host_key, sector.host_key);
-                assert!(event.bytes > 0, "served shards carry a byte count");
-            }
-
-            // `recorded()` force-flushed the read path's queue; assert the
-            // captured envelope is signed over the versioned preimage. The
-            // capture fixture holds its own reporting key (independent of the
-            // SDK's app key), so verify against the identity the envelope
-            // names, exactly like the moneyd ingest does.
-            let attempts = capture.attempts();
-            assert_eq!(
-                attempts.len(),
-                1,
-                "the recorded events must flush as exactly one envelope"
-            );
-            let envelope: serde_json::Value =
-                serde_json::from_slice(&attempts[0]).expect("envelope is json");
-            let identity = envelope["identity"].as_str().expect("identity is a string");
-            assert!(
-                identity.starts_with("ed25519:"),
-                "identity is an ed25519:<hex> string"
-            );
-            let identity_key: PublicKey = identity.parse().expect("identity is a public key");
-
-            let mut body = envelope.clone();
-            body.as_object_mut()
-                .expect("envelope is an object")
-                .remove("signature");
-            let body_bytes = serde_json::to_vec(&body).expect("body serializes");
-            let mut preimage = b"tessera-egress-v1:".to_vec();
-            preimage.extend_from_slice(&body_bytes);
-            let signature = envelope["signature"]
-                .as_str()
-                .expect("signature is a string")
-                .strip_prefix("ed25519:")
-                .expect("signature prefix");
-            let mut sig = [0u8; 64];
-            hex::decode_to_slice(signature, &mut sig).expect("signature is 64 bytes of hex");
-            assert!(
-                identity_key.verify(&preimage, &Signature::from(sig)),
-                "the read path's envelope must carry a valid raw Ed25519 signature"
-            );
-        })
-        .await;
     }
 }

@@ -661,19 +661,15 @@ impl Upload {
         if len == 0 {
             return Ok(());
         }
-        // P3b egress reporting is plumbed only through `Sdk::download`; the
-        // packed-upload read-back passes `None` and reports nothing.
         let download = Download::new(
             object,
             self.client.clone(),
             self.app_key.clone(),
-            None,
             DownloadOptions {
                 offset,
                 length: Some(len),
                 ..Default::default()
-            },
-        )?;
+            })?;
         self.read(data_key.clone(), download).await?;
         Ok(())
     }
@@ -1202,7 +1198,7 @@ mod tests {
 
         let mut recovered = Vec::with_capacity(expected.len());
         let mut download =
-            Download::new(&new, hosts, app_key, None, DownloadOptions::default()).unwrap();
+            Download::new(&new, hosts, app_key, DownloadOptions::default()).unwrap();
         tokio::io::copy(&mut download, &mut recovered)
             .await
             .unwrap();

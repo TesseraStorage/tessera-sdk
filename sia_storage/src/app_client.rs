@@ -5,7 +5,7 @@ use crate::encryption::EncryptionKey;
 use crate::hosts::Host;
 use blake2::Digest;
 use chrono::{DateTime, Utc};
-use reqwest::{Method, StatusCode};
+use reqwest::Method;
 use serde_with::base64::Base64;
 use serde_with::{DefaultOnNull, serde_as};
 use sia_core::blake2::Blake2b256;
@@ -78,22 +78,6 @@ pub enum Error {
     /// A custom error.
     #[error("custom error: {0}")]
     Custom(String),
-}
-
-/// Errors that can occur when reporting a signed egress batch.
-#[derive(Debug, Error)]
-pub(crate) enum EgressReportError {
-    /// The request could not be delivered to the reporting endpoint.
-    #[error("transport error: {0}")]
-    Transport(String),
-
-    /// The reporting endpoint returned a retryable status (429 or 5xx).
-    #[error("retryable egress response: {0}")]
-    Retryable(StatusCode),
-
-    /// The reporting endpoint rejected the batch; it must not be retried.
-    #[error("egress batch rejected: {0}")]
-    Rejected(String),
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -443,22 +427,6 @@ impl Client {
         }
     }
 
-    /// Reports a signed egress batch to `url` (P3b).
-    ///
-    /// The body is the canonical signed envelope built by
-    /// [`crate::EgressReporter`]. Retryability is expressed through
-    /// [`EgressReportError`] so callers can resend the identical bytes.
-    pub(crate) async fn report_egress(
-        &self,
-        url: &Url,
-        body: &[u8],
-    ) -> Result<(), EgressReportError> {
-        match self {
-            Self::Http(c) => c.report_egress(url, body).await,
-            #[cfg(any(test, feature = "mock"))]
-            Self::Mock(c) => c.report_egress(url, body).await,
-        }
-    }
 }
 
 fn request_hash(
