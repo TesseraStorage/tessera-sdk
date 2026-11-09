@@ -683,7 +683,6 @@ dependencies = [
  "curve25519-dalek-derive",
  "digest 0.11.3",
  "fiat-crypto",
- "rand_core",
  "rustc_version",
  "subtle",
  "zeroize",
@@ -850,9 +849,7 @@ checksum = "6ebaa1a2bf1290ab3bfe5a7b771d050ebffab2711c19a81691c683a5144a25de"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
- "rand_core",
  "sha2",
- "signature",
  "subtle",
  "zeroize",
 ]
@@ -2477,6 +2474,8 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 [[package]]
 name = "sia_core"
 version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9b107a60010b4547ffb011945012f1b143515a811ff5d1b25a9282f5f1501dc"
 dependencies = [
  "base64 0.23.0",
  "bip39",
@@ -2484,44 +2483,41 @@ dependencies = [
  "blake2b_simd",
  "bytes",
  "chrono",
- "criterion",
  "ed25519-dalek",
- "getrandom 0.4.3",
  "hex",
  "num-bigint",
  "num-rational",
  "num-traits",
- "rand",
  "serde",
  "serde_json",
  "sia_core_derive",
  "thiserror",
  "tokio",
  "uint",
- "wasm-bindgen-test",
  "zeroize",
 ]
 
 [[package]]
 name = "sia_core_derive"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8be79c90e1acc58de1787a54f4bfca36a33be9c6a4b5ac0be98de7eca1ef5926"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 2.0.119",
 ]
 
 [[package]]
 name = "sia_mux"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc2ed140d294a2f4e93e87445c6abc738dbba91492aa297fcab9fe26cbd7bea"
 dependencies = [
  "blake2b_simd",
  "bytes",
- "criterion",
  "ed25519-dalek",
- "getrandom 0.4.3",
  "ring",
- "serde_json",
  "thiserror",
  "tokio",
  "x25519-dalek",
@@ -2540,120 +2536,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "sia_storage"
-version = "0.11.0"
-dependencies = [
- "base64 0.23.0",
- "blake2",
- "blake2b_simd",
- "bytes",
- "chacha20",
- "chacha20poly1305",
- "chrono",
- "clap",
- "criterion",
- "directories",
- "ed25519-dalek",
- "env_logger",
- "getrandom 0.4.3",
- "hex",
- "hkdf",
- "httptest",
- "indicatif",
- "js-sys",
- "log",
- "rand",
- "reqwest",
- "serde",
- "serde_json",
- "serde_with",
- "sha2",
- "sia_core",
- "sia_core_derive",
- "sia_mux",
- "sia_reed_solomon",
- "sysinfo",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "toml 1.1.3+spec-1.1.0",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-bindgen-test",
- "web-sys",
- "web-time",
- "zeroize",
-]
-
-[[package]]
-name = "sia_storage_ffi"
-version = "0.10.0"
-dependencies = [
- "async-trait",
- "log",
- "rand",
- "sia_core",
- "sia_storage",
- "thiserror",
- "tokio",
- "tokio-util",
- "uniffi",
- "zeroize",
-]
-
-[[package]]
-name = "sia_storage_napi"
-version = "0.9.0"
-dependencies = [
- "bytes",
- "chrono",
- "futures-core",
- "log",
- "napi",
- "napi-build",
- "napi-derive",
- "sia_core",
- "sia_storage",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tokio-util",
-]
-
-[[package]]
-name = "sia_storage_wasm"
-version = "0.5.0"
-dependencies = [
- "chrono",
- "console_error_panic_hook",
- "futures-util",
- "hex",
- "js-sys",
- "log",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "sia_core",
- "sia_storage",
- "tokio",
- "tokio-util",
- "tsify",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-streams",
- "web-sys",
-]
-
-[[package]]
 name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
-dependencies = [
- "rand_core",
-]
 
 [[package]]
 name = "siphasher"
@@ -2780,6 +2666,112 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tessera_storage"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.0",
+ "blake2",
+ "blake2b_simd",
+ "bytes",
+ "chacha20",
+ "chacha20poly1305",
+ "chrono",
+ "clap",
+ "criterion",
+ "directories",
+ "ed25519-dalek",
+ "env_logger",
+ "getrandom 0.4.3",
+ "hex",
+ "hkdf",
+ "httptest",
+ "indicatif",
+ "js-sys",
+ "log",
+ "rand",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "sia_core",
+ "sia_core_derive",
+ "sia_mux",
+ "sia_reed_solomon",
+ "sysinfo",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml 1.1.3+spec-1.1.0",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
+ "web-time",
+ "zeroize",
+]
+
+[[package]]
+name = "tessera_storage_ffi"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "log",
+ "rand",
+ "sia_core",
+ "tessera_storage",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "uniffi",
+ "zeroize",
+]
+
+[[package]]
+name = "tessera_storage_napi"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "chrono",
+ "futures-core",
+ "log",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "sia_core",
+ "tessera_storage",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+]
+
+[[package]]
+name = "tessera_storage_wasm"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "console_error_panic_hook",
+ "futures-util",
+ "hex",
+ "js-sys",
+ "log",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "sia_core",
+ "tessera_storage",
+ "tokio",
+ "tokio-util",
+ "tsify",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-streams",
+ "web-sys",
 ]
 
 [[package]]

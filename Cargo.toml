@@ -1,6 +1,22 @@
 [workspace]
 resolver = "2"
-members = ["sia_core", "sia_core_derive", "sia_storage", "sia_storage_ffi", "sia_storage_napi", "sia_storage_wasm", "sia_mux"]
+members = [
+    "tessera_storage",
+    "tessera_storage_ffi",
+    "tessera_storage_napi",
+    "tessera_storage_wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/TesseraStorage/tessera-sdk"
+homepage = "https://tessera.storage"
+authors = ["Tessera Storage <dev@tessera.storage>"]
+
+[workspace.dependencies]
+tessera_storage = { path = "tessera_storage", version = "0.1.0" }
 
 # CPU-intensive operations (erasure coding, hashing, encryption) are
 # ~100x slower without optimizations. Some tests will be extremely

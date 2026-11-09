@@ -1,3 +1,8 @@
 **/target
 .vscode
 .DS_Store
+node_modules/
+tessera_storage_wasm/pkg/
+tessera_storage_napi/examples/index.js
+tessera_storage_napi/examples/index.d.ts
+tessera_storage_napi/examples/*.node

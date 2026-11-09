@@ -1,6 +1,10 @@
+Tessera Storage fork of the Sia Foundation's sia-sdk-rs
+(https://github.com/SiaFoundation/sia-sdk-rs).
+
 The MIT License (MIT)
 
 Copyright (c) 2024 The Sia Foundation
+Copyright (c) 2026 Tessera Storage
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

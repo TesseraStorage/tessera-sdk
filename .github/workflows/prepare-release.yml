@@ -4,16 +4,18 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - master
+      - tessera
 
 permissions:
   contents: write
   pull-requests: write
 
 jobs:
+  # Disabled with the publish job. Re-enable only after the Tessera crate
+  # and npm names are the ones this workflow would tag.
   prepare-release:
-    if: "!contains(github.event.head_commit.message, 'chore: prepare releases')" # Skip merges from releases
-    runs-on: tenki-standard-medium-4c-8g
+    if: false
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
         with:
@@ -31,7 +33,7 @@ jobs:
           delete-branch: true
           commit-message: "chore: prepare releases"
           title: Release Versions
-          base: master
+          base: tessera
           branch: release
           body: |
             This PR was automatically created to prepare the release versions. Close the PR when you are ready to release. See the changelog for more details.
