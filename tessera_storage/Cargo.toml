@@ -19,7 +19,7 @@ bench = false
 serde = "1.0.229"
 serde_json = "1.0.151"
 thiserror = "2.0.19"
-sia_core = "=0.4.2"
+sia_core = "=0.6.1"
 rand = "0.10.2"
 blake2b_simd = "1.0.4"
 url = { version = "2.5.8", features = ["serde"] }
@@ -30,9 +30,9 @@ hex = "0.4.3"
 chacha20poly1305 = "0.11.0"
 chacha20 = { version = "0.10.1", features = ["xchacha"] }
 chrono = { version = "0.4.45", features = ["serde"] }
-blake2 = "0.10.6"
+blake2 = "0.11.0"
 zeroize = { version = "1.9.0", features = ["derive"] }
-hkdf = "0.12.4"
+hkdf = "0.13.0"
 base64 = "0.23.0"
 ed25519-dalek = "3.0.0"
 web-time = "1"
@@ -45,8 +45,8 @@ sia_reed_solomon = "0.3.0"
 # do not update to reqwest v0.13 until https://github.com/seanmonstar/reqwest/issues/2968 is resolved
 reqwest = { version = "0.12.28", default-features = false, features = ["charset", "http2", "json", "rustls-tls"] }
 tokio = { version = "1.53.1", features = ["sync", "io-util", "macros", "rt", "time"] }
-sia_mux = "=0.1.2"
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sia_mux = "=0.1.5"
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 
 # --- WASM-only dependencies ---
 [target.'cfg(target_arch = "wasm32")'.dependencies]
