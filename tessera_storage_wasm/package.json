@@ -1,0 +1,20 @@
+{
+  "name": "@tessera-storage/sdk-wasm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser bindings for the Tessera storage SDK",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TesseraStorage/tessera-sdk.git"
+  },
+  "type": "module",
+  "files": [
+    "pkg"
+  ],
+  "main": "./pkg/tessera_storage_wasm.js",
+  "types": "./pkg/tessera_storage_wasm.d.ts",
+  "scripts": {
+    "build": "wasm-pack build --target web --release --out-dir pkg && node scripts/npm-metadata.mjs"
+  }
+}

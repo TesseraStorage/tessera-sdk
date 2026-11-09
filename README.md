@@ -1,23 +1,24 @@
-# Sia SDK for Rust
+# Tessera SDK for Rust
 
-A collection of Rust crates for building applications on the [Sia](https://sia.tech) decentralized storage network.
+Rust SDK for storing and retrieving data through a [Tessera](https://tessera.storage) indexer. Fork of the Sia Foundation's [sia-sdk-rs](https://github.com/SiaFoundation/sia-sdk-rs).
 
-Sia is a decentralized cloud storage platform where data is stored across a global network of independent hosts. Storage contracts are enforced by the Sia blockchain, so no single party controls your data. Compared to centralized providers, Sia offers lower costs, stronger privacy (data is client-side encrypted by default), and censorship resistance.
+Data is client-side encrypted, erasure-coded, and stored on the Sia network. This SDK does not report download usage itself; billing is metered on the server.
 
 ## Crates
 
 | Crate | Description |
 |-------|-------------|
-| [`sia_core`](sia_core/) | Core Sia types: addresses, keys, transactions, encoding, and the RHP4 protocol. |
-| [`sia_storage`](sia_storage/) | High-level SDK for uploading and downloading data through an indexer. |
-| [`sia_storage_ffi`](sia_storage_ffi/) | UniFFI bindings for `sia_storage`, targeting Swift, Kotlin, and Python. |
-| [`sia_storage_napi`](sia_storage_napi/) | Node.js bindings for `sia_storage` via N-API. |
-| [`sia_mux`](sia_mux/) | Multiplexed stream transport used by the RHP4 protocol. |
+| [`tessera_storage`](tessera_storage/) | High-level SDK for uploading and downloading data through an indexer. |
+| [`tessera_storage_ffi`](tessera_storage_ffi/) | UniFFI bindings for `tessera_storage`, targeting Swift, Kotlin, and Python. |
+| [`tessera_storage_napi`](tessera_storage_napi/) | Node.js bindings, published as `@tessera-storage/sdk`. |
+| [`tessera_storage_wasm`](tessera_storage_wasm/) | Browser bindings, published as `@tessera-storage/sdk-wasm`. |
+
+`sia_core`, `sia_core_derive`, and `sia_mux` are unchanged upstream crates consumed from crates.io.
 
 ## Status
 
-This project is under active development. The API will have breaking changes until 1.0.
+Workspace version 0.1.0. The API can still change.
 
 ## License
 
-Licensed under the MIT License.
+MIT. Copyright in the upstream work remains with the Sia Foundation. See [LICENSE](LICENSE).

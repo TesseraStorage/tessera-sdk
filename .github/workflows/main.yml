@@ -3,7 +3,7 @@ name: Main
 on:
   push:
     branches:
-      - master
+      - tessera
   pull_request:
 
 permissions:
@@ -12,7 +12,7 @@ permissions:
 jobs:
   lint:
     name: Lint
-    runs-on: tenki-standard-medium-4c-8g
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Setup Environment
@@ -26,7 +26,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features --workspace -- -D warnings
       - name: Clippy (wasm)
-        run: cargo clippy --target wasm32-unknown-unknown --lib --tests --package sia_core --package sia_storage --package sia_storage_wasm --no-default-features -- -D warnings
+        run: cargo clippy --target wasm32-unknown-unknown --lib --tests --package tessera_storage --package tessera_storage_wasm --no-default-features -- -D warnings
       - name: Build docs
         run: cargo doc --all-features --no-deps
         env:
@@ -34,15 +34,9 @@ jobs:
 
   test:
     name: Test native
-    runs-on: tenki-standard-medium-4c-8g
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-      - name: Setup Go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version: 'stable'
-      - name: Build Go interop helper
-        run: cd sia_mux/testutil/go-interop && go build -o interop .
       - name: Setup Rust
         run: rustup update stable
       - name: Build benches
@@ -51,10 +45,10 @@ jobs:
         run: cargo test --all-features
       - name: Check feature combinations
         run: |
-          cargo check -p sia_storage --all-targets
-          cargo check -p sia_storage --all-targets --features=mock
-          cargo check -p sia_storage --all-targets --features=less-safe-crypto
-          cargo check -p sia_storage --all-targets --features=fs
+          cargo check -p tessera_storage --all-targets
+          cargo check -p tessera_storage --all-targets --features=mock
+          cargo check -p tessera_storage --all-targets --features=less-safe-crypto
+          cargo check -p tessera_storage --all-targets --features=fs
 
   test-wasm:
     name: Test WASM (${{ matrix.runtime }})
@@ -62,7 +56,7 @@ jobs:
       fail-fast: false
       matrix:
         runtime: [chrome, firefox, node]
-    runs-on: tenki-standard-medium-4c-8g
+    runs-on: ubuntu-latest
     env:
       WASM_BINDGEN_TEST_TIMEOUT: '300'
     steps:
@@ -80,69 +74,14 @@ jobs:
             echo "WASM_FLAGS=--headless --${{ matrix.runtime }}" >> "$GITHUB_ENV"
             echo "WASM_BINDGEN_USE_BROWSER=1" >> "$GITHUB_ENV"
           fi
-      - name: Test sia_core merkle (simd128)
-        run: cd sia_core && wasm-pack test --release $WASM_FLAGS -- --lib
-      - name: Test sia_storage
-        run: cd sia_storage && wasm-pack test --release $WASM_FLAGS -- --lib
-
-  # The blake2b backend is selected at runtime, so each must be exercised on a
-  # CPU that actually has its target features. RunsOn supplies the families.
-  simd:
-    name: Test SIMD (${{ matrix.name }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: AVX-512 # Sapphire Rapids
-            runner: runs-on=${{ github.run_id }}/family=c7i/image=ubuntu24-full-x64
-            arch: x86_64
-            require: avx512f
-            disallow: ""
-          - name: AVX2 # Zen 3: AVX2 but no AVX-512, so the dispatcher picks AVX2
-            runner: runs-on=${{ github.run_id }}/family=c6a/image=ubuntu24-full-x64
-            arch: x86_64
-            require: avx2
-            disallow: avx512f
-          - name: NEON # Graviton 4
-            runner: runs-on=${{ github.run_id }}/family=c8g/image=ubuntu24-full-arm64
-            arch: aarch64
-            require: asimd
-            disallow: ""
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-      - name: Confirm CPU features
-        run: |
-          set -e
-          echo "uname: $(uname -a)"
-          if [ "${{ matrix.arch }}" = "x86_64" ]; then
-            features=$(grep -m1 '^flags' /proc/cpuinfo | sed 's/.*: //')
-          else
-            features=$(grep -m1 '^Features' /proc/cpuinfo | sed 's/.*: //')
-          fi
-          echo "features: $features"
-          if ! echo " $features " | grep -qw "${{ matrix.require }}"; then
-            echo "required feature '${{ matrix.require }}' missing on this runner"
-            exit 1
-          fi
-          if [ -n "${{ matrix.disallow }}" ] && echo " $features " | grep -qw "${{ matrix.disallow }}"; then
-            echo "runner has '${{ matrix.disallow }}'; dispatcher would select a different backend"
-            exit 1
-          fi
-      - name: Setup Rust
-        # Fresh install rather than update; avoids a cross-device rename error on these runners.
-        run: |
-          rustup self update
-          rm -rf ~/.rustup
-          rustup toolchain install stable
-      - name: Test
-        run: cargo test -p sia_core merkle
+      - name: Test tessera_storage
+        run: cd tessera_storage && wasm-pack test --release $WASM_FLAGS -- --lib
 
   # Single required check for branch protection. Skipped (and therefore
   # non-passing) whenever any upstream job fails.
   success:
     name: success
-    needs: [lint, test, test-wasm, simd]
-    runs-on: tenki-standard-medium-4c-8g
+    needs: [lint, test, test-wasm]
+    runs-on: ubuntu-latest
     steps:
       - run: echo success
