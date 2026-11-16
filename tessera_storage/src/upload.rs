@@ -19,8 +19,10 @@ use bytes::Bytes;
 use log::debug;
 use sia_core::rhp4::SECTOR_SIZE;
 use sia_core::signing::PublicKey;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use thiserror::Error;
-use tokio::io::{AsyncRead, BufReader};
+use tokio::io::{AsyncRead, BufReader, ReadBuf};
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinSet;
 
@@ -660,8 +662,7 @@ impl Upload {
                 offset,
                 length: Some(len),
                 ..Default::default()
-            },
-        )?;
+            })?;
         self.read(data_key.clone(), download).await?;
         Ok(())
     }
@@ -807,6 +808,85 @@ impl PackedUpload {
 /// pass the object returned from the earlier call. Appending data changes
 /// an object's ID. It must be re-pinned afterward and any references to
 /// the previous ID must be updated.
+/// The exact one-byte substitution for a zero-length upload: the ASCII
+/// character "0" (0x30). Fixed, not configurable and not unique per file --
+/// see sonnet-packet-empty-file-client-sentinel (2026-11-17). Indexd
+/// rejects any object with zero slabs and that stays a server rule by
+/// product decision, so a genuinely empty upload is never sent to the wire
+/// empty.
+const EMPTY_FILE_SENTINEL: u8 = b'0';
+
+/// Wraps a reader so that a genuinely empty input (immediate EOF on the
+/// very first read) is replaced with the single byte [`EMPTY_FILE_SENTINEL`].
+/// Any reader that yields at least one byte is passed straight through,
+/// byte for byte, with no copying beyond the first read. This is the one
+/// substitution point shared by every [`SDK::upload`](crate::SDK::upload)
+/// caller -- CLI-style file uploads, and in-memory/stream uploads from the
+/// NAPI and WASM bindings alike -- so no caller has to know up front
+/// whether its input is empty.
+struct EmptyFileSentinelReader<R> {
+    inner: R,
+    state: SentinelState,
+}
+
+enum SentinelState {
+    /// Nothing read yet; the substitution decision hasn't been made.
+    Undecided,
+    /// The inner reader was non-empty; pass every further read straight through.
+    PassThrough,
+    /// The inner reader was empty; the sentinel byte still needs to be emitted.
+    PendingSentinel,
+    /// The sentinel byte has been emitted; behave as EOF from here on.
+    Done,
+}
+
+impl<R> EmptyFileSentinelReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            state: SentinelState::Undecided,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for EmptyFileSentinelReader<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            match this.state {
+                SentinelState::PassThrough => {
+                    return Pin::new(&mut this.inner).poll_read(cx, buf);
+                }
+                SentinelState::Done => return Poll::Ready(Ok(())),
+                SentinelState::PendingSentinel => {
+                    buf.put_slice(&[EMPTY_FILE_SENTINEL]);
+                    this.state = SentinelState::Done;
+                    return Poll::Ready(Ok(()));
+                }
+                SentinelState::Undecided => {
+                    let before = buf.filled().len();
+                    match Pin::new(&mut this.inner).poll_read(cx, buf) {
+                        Poll::Ready(Ok(())) => {
+                            if buf.filled().len() > before {
+                                this.state = SentinelState::PassThrough;
+                                return Poll::Ready(Ok(()));
+                            }
+                            // Immediate EOF with zero bytes: genuinely empty input.
+                            this.state = SentinelState::PendingSentinel;
+                            continue;
+                        }
+                        other => return other,
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn upload_object<R: AsyncRead + Unpin>(
     hosts: Hosts,
     app_key: Arc<AppKey>,
@@ -817,6 +897,11 @@ pub(crate) async fn upload_object<R: AsyncRead + Unpin>(
     // buffer the reader since SlabReader reads 64 bytes at a time
     let reader = BufReader::new(reader);
     let Some(start_offset) = options.start_offset else {
+        // Empty-file client sentinel (2026-11-17): only a brand-new upload
+        // (no start_offset) can turn into a genuinely empty object -- an
+        // append/overwrite with zero new bytes is a legitimate no-op
+        // (handled below, unaffected) rather than "the file is empty".
+        let reader = EmptyFileSentinelReader::new(reader);
         let mut upload = Upload::new(hosts, app_key, options)?;
         upload.read(object.data_key.clone(), reader).await?;
         object.slabs.extend(upload.finish().await?);
@@ -1286,5 +1371,96 @@ mod tests {
         for (new_slab, base_slab) in new.slabs().iter().zip(base.slabs()) {
             assert_eq!(new_slab.encryption_key, base_slab.encryption_key);
         }
+    }
+
+    fn test_hosts() -> Hosts {
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport));
+        hosts.update(
+            (0..60)
+                .map(|_| test_host(PrivateKey::from_seed(&rand::random()).public_key()))
+                .collect(),
+            true,
+        );
+        hosts
+    }
+
+    /// Packet: sonnet-packet-empty-file-client-sentinel (2026-11-17). A
+    /// zero-byte input produces an object with exactly one slab whose
+    /// content, once downloaded, is exactly the one byte "0" (0x30) -- and
+    /// indexd's real ErrObjectMinimumSlabs rule (zero slabs) can never
+    /// fire, since upload_object never hands it a zero-slab object.
+    #[sia_core_derive::cross_target_test]
+    async fn test_empty_input_becomes_one_byte_sentinel_object() {
+        let hosts = test_hosts();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        let obj = upload_object(
+            hosts.clone(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(Vec::<u8>::new()),
+            UploadOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(obj.size(), 1, "a zero-byte input must become a 1-byte object");
+        assert_eq!(obj.slabs().len(), 1, "indexd rejects zero slabs; there must be exactly one");
+
+        let mut recovered = Vec::new();
+        let mut download =
+            Download::new(&obj, hosts, app_key, DownloadOptions::default()).unwrap();
+        tokio::io::copy(&mut download, &mut recovered)
+            .await
+            .unwrap();
+        assert_eq!(recovered, vec![b'0'], "stored content must be exactly the ASCII \"0\" sentinel");
+    }
+
+    /// Non-empty input is never touched by the sentinel substitution, byte
+    /// for byte, including an input that happens to start with the
+    /// sentinel byte itself.
+    #[sia_core_derive::cross_target_test]
+    async fn test_non_empty_input_is_unchanged() {
+        let hosts = test_hosts();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+        let data = Bytes::from_static(b"0 is not special when the file really has content");
+
+        let obj = upload_object(
+            hosts.clone(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.clone()),
+            UploadOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(obj.size(), data.len() as u64);
+
+        let mut recovered = Vec::new();
+        let mut download =
+            Download::new(&obj, hosts, app_key, DownloadOptions::default()).unwrap();
+        tokio::io::copy(&mut download, &mut recovered)
+            .await
+            .unwrap();
+        assert_eq!(recovered, data.to_vec());
+    }
+
+    /// EmptyFileSentinelReader unit-level: exercises the reader adapter in
+    /// isolation, independent of the upload pipeline, for both branches.
+    #[sia_core_derive::cross_target_test]
+    async fn test_empty_file_sentinel_reader() {
+        use tokio::io::AsyncReadExt;
+
+        let mut empty = EmptyFileSentinelReader::new(Cursor::new(Vec::<u8>::new()));
+        let mut got = Vec::new();
+        empty.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, vec![b'0']);
+
+        let mut nonempty = EmptyFileSentinelReader::new(Cursor::new(b"hello".to_vec()));
+        let mut got = Vec::new();
+        nonempty.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got, b"hello".to_vec());
     }
 }
