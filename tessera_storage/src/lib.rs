@@ -933,11 +933,24 @@ mod test {
         let objects = packed_upload.finalize().await.expect("upload to finish");
         assert_eq!(objects.len(), 3);
 
-        // empty objects have zero slabs and zero size
-        assert_eq!(objects[0].slabs().len(), 0);
-        assert_eq!(objects[0].size(), 0);
-        assert_eq!(objects[2].slabs().len(), 0);
-        assert_eq!(objects[2].size(), 0);
+        // empty entries are substituted with the one-byte sentinel "0" (0x30)
+        // so they are never genuine zero-slab objects (indexd rejects those).
+        for &idx in &[0, 2] {
+            assert_eq!(objects[idx].size(), 1);
+            assert!(!objects[idx].slabs().is_empty());
+            let mut output = BytesMut::zeroed(1);
+            let mut download = Download::new(
+                &objects[idx],
+                hosts.clone(),
+                app_key.clone(),
+                DownloadOptions::default(),
+            )
+            .unwrap();
+            copy(&mut download, &mut Cursor::new(&mut output[..]))
+                .await
+                .expect("download empty sentinel to complete");
+            assert_eq!(output.freeze(), Bytes::from_static(b"0"));
+        }
 
         // the non-empty object should round-trip normally
         assert_eq!(objects[1].slabs().len(), 1);

@@ -747,6 +747,11 @@ impl PackedUpload {
         let object = Object::default();
         // buffer the reader since SlabReader reads 64 bytes at a time
         let r = BufReader::new(r);
+        // Empty-file client sentinel (2026-11-17): an empty entry inside a
+        // pack is the same shape of problem as a zero-byte single-object
+        // upload. Substitute the one-byte "0" so the sub-object is never
+        // a genuine zero-slab object (indexd rejects those).
+        let r = EmptyFileSentinelReader::new(r);
         let start = self.upload.length();
         let n = self.upload.read(object.data_key.clone(), r).await?;
         let end = self.upload.length();
