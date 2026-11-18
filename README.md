@@ -17,7 +17,7 @@ Data is client-side encrypted, erasure-coded, and stored on the Sia network. Thi
 
 ## Status
 
-Workspace version 0.1.0. The API can still change.
+Workspace version 0.2.0. The API can still change.
 
 ## License
 

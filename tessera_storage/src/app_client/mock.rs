@@ -36,6 +36,9 @@ struct State {
     objects: HashMap<Hash256, StoredObject>,
     slabs: HashMap<Hash256, PinnedSlab>,
     user_secret: Hash256,
+    // Test failure injection: when set, the call returns this error.
+    pin_slabs_error: Option<String>,
+    pin_object_error: Option<String>,
 }
 
 /// An in-memory stand-in for the indexer API.
@@ -57,6 +60,15 @@ impl Client {
     /// Appends to the host list returned by [`Client::hosts`].
     pub(crate) fn add_hosts(&self, hosts: Vec<Host>) {
         self.state.write().unwrap().hosts.extend(hosts);
+    }
+
+    /// Makes `pin_slabs` and `pin_object` fail with the given messages, or
+    /// succeed again with `None`.
+    #[allow(dead_code)] // used in tests
+    pub(crate) fn set_pin_errors(&self, pin_slabs: Option<&str>, pin_object: Option<&str>) {
+        let mut state = self.state.write().unwrap();
+        state.pin_slabs_error = pin_slabs.map(str::to_string);
+        state.pin_object_error = pin_object.map(str::to_string);
     }
 
     /// Returns the number of slabs currently pinned.
@@ -204,6 +216,9 @@ impl Client {
         object: &SealedObject,
     ) -> Result<(), Error> {
         let mut state = self.state.write().unwrap();
+        if let Some(err) = &state.pin_object_error {
+            return Err(Error::Api(err.clone()));
+        }
         state.objects.insert(
             object.id(),
             StoredObject {
@@ -252,6 +267,9 @@ impl Client {
         slabs: &[SlabPinParams],
     ) -> Result<Vec<Hash256>, Error> {
         let mut state = self.state.write().unwrap();
+        if let Some(err) = &state.pin_slabs_error {
+            return Err(Error::Api(err.clone()));
+        }
         Ok(slabs
             .iter()
             .map(|params| {
