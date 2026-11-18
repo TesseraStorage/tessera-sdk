@@ -8,6 +8,7 @@ use std::task::{Poll, ready};
 use crate::congestion::InflightController;
 use crate::encryption::{Chacha20Cipher, EncryptionKey, encrypt_recovered_shards};
 use crate::erasure_coding::{self, ErasureCoder};
+use crate::hooks::{self, DownloadCompleteEvent, HookFn};
 use crate::hosts::{Hosts, InflightGuard, RPCError};
 use crate::slabs::SlabVersion::{V0, V1};
 use crate::time::{Duration, Elapsed, Instant, sleep};
@@ -513,6 +514,18 @@ pub struct Download {
     errored: bool,
 
     shard_downloaded: Option<ShardProgressCallback>,
+
+    // Set by `notify_on_complete` when an agent hook is attached.
+    pub(crate) completion: Option<Completion>,
+}
+
+/// Tracks delivered bytes for the `on_download_complete` agent hook.
+pub(crate) struct Completion {
+    object_id: Hash256,
+    start: Instant,
+    bytes: u64,
+    hook: HookFn<DownloadCompleteEvent>,
+    fired: bool,
 }
 
 impl AsyncRead for Download {
@@ -547,6 +560,9 @@ impl AsyncRead for Download {
             self.refill();
             self.buf = Bytes::from(result);
             self.drain_buf(buf);
+        } else {
+            // nothing buffered or queued: this read is EOF
+            self.complete();
         }
         Poll::Ready(Ok(()))
     }
@@ -557,6 +573,47 @@ impl Download {
         let to_copy = std::cmp::min(buf.remaining(), self.buf.len());
         buf.put_slice(&self.buf[..to_copy]);
         self.buf.advance(to_copy);
+        self.count(to_copy);
+    }
+
+    /// Reports `id` and the number of bytes delivered to `hook` once the
+    /// download reaches EOF.
+    pub(crate) fn notify_on_complete(
+        mut self,
+        object_id: Hash256,
+        hook: HookFn<DownloadCompleteEvent>,
+    ) -> Self {
+        self.completion = Some(Completion {
+            object_id,
+            start: Instant::now(),
+            bytes: 0,
+            hook,
+            fired: false,
+        });
+        self
+    }
+
+    fn count(&mut self, n: usize) {
+        if let Some(c) = &mut self.completion {
+            c.bytes += n as u64;
+        }
+    }
+
+    fn complete(&mut self) {
+        if let Some(c) = &mut self.completion
+            && !c.fired
+        {
+            c.fired = true;
+            hooks::fire(
+                "on_download_complete",
+                &c.hook,
+                DownloadCompleteEvent {
+                    object_id: c.object_id,
+                    bytes: c.bytes,
+                    elapsed: c.start.elapsed(),
+                },
+            );
+        }
     }
 
     /// Marks the download as errored and aborts all in-flight chunk tasks.
@@ -639,9 +696,12 @@ impl Download {
         // If a previous AsyncRead poll left a partial buffer, drain it first
         // so callers mixing read_chunk and poll_read don't lose data.
         if !self.buf.is_empty() {
-            return Ok(std::mem::take(&mut self.buf).to_vec());
+            let data = std::mem::take(&mut self.buf).to_vec();
+            self.count(data.len());
+            return Ok(data);
         }
         let Some(chunk_handle) = self.queue.pop_front() else {
+            self.complete();
             return Ok(Vec::new()); // EOF
         };
         self.popped.send_modify(|p| *p += 1);
@@ -657,6 +717,7 @@ impl Download {
             }
         };
         self.refill();
+        self.count(result.len());
         Ok(result)
     }
 
@@ -699,6 +760,7 @@ impl Download {
             popped: watch::channel(0).0,
             errored: false,
             shard_downloaded: options.shard_downloaded,
+            completion: None,
         };
         download.refill();
         Ok(download)

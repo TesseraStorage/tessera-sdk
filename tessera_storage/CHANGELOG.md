@@ -1,3 +1,15 @@
+## 0.2.0 (2026-11-18)
+
+### Features
+
+- Agent hooks: `Sdk::with_agent_hooks` attaches `AgentHooks` with optional `on_upload_complete`, `on_download_complete` and `on_write_failed` callbacks. Hooks are fire-and-forget and a panic in a hook does not affect the transfer.
+- `WriteFailedEvent::stage` tells a write that never left the process (`WriteFailureStage::NotSent`) from one that sent shard data but was not registered (`SentNotRegistered`) and from a failed pin (`PinFailed`, with `slabs_pinned`).
+- `Object::set_agent_metadata` and `Object::agent_metadata` store and read `AgentMetadata` under the `agent` key of the encrypted object metadata, keeping other keys unchanged.
+
+### Fixes
+
+- A zero-byte upload, including an empty entry in a packed upload, is stored as a one-byte object containing `0`, because the indexer rejects objects with no slabs.
+
 ## 0.1.0
 
 First Tessera release. The crate is `tessera_storage` (workspace version 0.1.0), a fork of the Sia Foundation's `sia_storage`. Client-side egress reporting is removed; download usage is metered on the server.

@@ -1,3 +1,7 @@
+## 0.2.0 (2026-11-18)
+
+Built on `tessera_storage` 0.2.0. The bindings do not expose agent hooks or agent metadata yet.
+
 ## 0.1.0
 
 First Tessera release of `tessera_storage_napi`. The npm package is `@tessera-storage/sdk`.

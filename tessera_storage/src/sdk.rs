@@ -1,6 +1,7 @@
 #[cfg(feature = "fs")]
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
 use log::debug;
@@ -11,6 +12,7 @@ use tokio::io::AsyncRead;
 use url::Url;
 
 use crate::app_client::{self, SlabPinParams};
+use crate::hooks::{self, AgentHooks, UploadCompleteEvent, WriteFailedEvent, WriteFailureStage};
 use crate::hosts::Hosts;
 use crate::rhp4::{Client, HostEndpoint};
 use crate::upload::{PackedUpload, upload_object};
@@ -54,6 +56,8 @@ pub struct Sdk {
     // Shared across `Sdk` clones and replaced, not merged, when the
     // next upload job fetches a new list.
     last_write_plate: Arc<std::sync::RwLock<Vec<Host>>>,
+    // Optional callbacks set by `with_agent_hooks`.
+    hooks: AgentHooks,
 }
 
 impl Sdk {
@@ -138,6 +142,7 @@ impl Sdk {
             api_client,
             hosts,
             last_write_plate: Arc::new(std::sync::RwLock::new(Vec::new())),
+            hooks: AgentHooks::default(),
         })
     }
 
@@ -147,6 +152,21 @@ impl Sdk {
     /// should store it safely.
     pub fn app_key(&self) -> &AppKey {
         &self.app_key
+    }
+
+    /// Returns this `Sdk` with the given [AgentHooks] attached. The hooks
+    /// report completed uploads and downloads and failed writes. They apply
+    /// to this `Sdk` and to clones made from it afterwards, and replace any
+    /// hooks attached before.
+    ///
+    /// ```ignore
+    /// let sdk = sdk.with_agent_hooks(
+    ///     AgentHooks::new().on_upload_complete(|ev| println!("stored {}", ev.object_id)),
+    /// );
+    /// ```
+    pub fn with_agent_hooks(mut self, hooks: AgentHooks) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     /// Returns the host list fetched at the start of the most recent upload job.
@@ -182,6 +202,84 @@ impl Sdk {
     /// The object containing the metadata needed to download. The caller must
     /// pin the object to the indexer after uploading.
     pub async fn upload<R: AsyncRead + Unpin + 'static>(
+        &self,
+        object: Object,
+        reader: R,
+        options: UploadOptions,
+    ) -> Result<Object, UploadError> {
+        if !self.hooks.observes_uploads() {
+            return self.upload_inner(object, reader, options).await;
+        }
+
+        let start = crate::time::Instant::now();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let acks = Arc::new(AtomicUsize::new(0));
+        let mut options = options;
+        {
+            let acks = acks.clone();
+            let user = options.shard_uploaded.take();
+            options.shard_uploaded = Some(Arc::new(move |progress| {
+                acks.fetch_add(1, Ordering::Relaxed);
+                if let Some(user) = &user {
+                    user(progress);
+                }
+            }));
+            let attempts = attempts.clone();
+            let user = options.attempt_started.take();
+            options.attempt_started = Some(Arc::new(move |attempt| {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                if let Some(user) = &user {
+                    user(attempt);
+                }
+            }));
+        }
+
+        let result = self.upload_inner(object, reader, options).await;
+        let elapsed = start.elapsed();
+        let attempts = attempts.load(Ordering::Relaxed);
+        let acks = acks.load(Ordering::Relaxed);
+        match &result {
+            Ok(object) => {
+                if let Some(hook) = &self.hooks.upload_complete {
+                    hooks::fire(
+                        "on_upload_complete",
+                        hook,
+                        UploadCompleteEvent {
+                            object_id: object.id(),
+                            size: object.size(),
+                            slabs: object.slabs().len(),
+                            shards_acknowledged: acks,
+                            elapsed,
+                        },
+                    );
+                }
+            }
+            Err(err) => {
+                if let Some(hook) = &self.hooks.write_failed {
+                    hooks::fire(
+                        "on_write_failed",
+                        hook,
+                        WriteFailedEvent {
+                            stage: if attempts > 0 {
+                                WriteFailureStage::SentNotRegistered
+                            } else {
+                                WriteFailureStage::NotSent
+                            },
+                            error: err.to_string(),
+                            object_id: None,
+                            write_attempts_started: attempts,
+                            shards_acknowledged: acks,
+                            slabs_pinned: 0,
+                            elapsed,
+                        },
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    async fn upload_inner<R: AsyncRead + Unpin + 'static>(
         &self,
         object: Object,
         reader: R,
@@ -268,7 +366,11 @@ impl Sdk {
             .await
             .map_err(|e| DownloadError::Custom(format!("map fetch: {e:?}")))?;
         let scoped_hosts = self.hosts.scoped(map_hosts);
-        Download::new(object, scoped_hosts, self.app_key.clone(), options)
+        let download = Download::new(object, scoped_hosts, self.app_key.clone(), options)?;
+        Ok(match &self.hooks.download_complete {
+            Some(hook) => download.notify_on_complete(object.id(), hook.clone()),
+            None => download,
+        })
     }
 
     /// Retrieves a list of hosts from the indexer matching the provided query
@@ -408,6 +510,34 @@ impl Sdk {
 
     /// Pins an object to the indexer
     pub async fn pin_object(&self, object: &Object) -> Result<(), Error> {
+        let Some(hook) = &self.hooks.write_failed else {
+            return self.pin_object_inner(object).await.map_err(|(_, e)| e);
+        };
+
+        let start = crate::time::Instant::now();
+        self.pin_object_inner(object)
+            .await
+            .map_err(|(slabs_pinned, err)| {
+                hooks::fire(
+                    "on_write_failed",
+                    hook,
+                    WriteFailedEvent {
+                        stage: WriteFailureStage::PinFailed,
+                        error: err.to_string(),
+                        object_id: Some(object.id()),
+                        write_attempts_started: 0,
+                        shards_acknowledged: 0,
+                        slabs_pinned,
+                        elapsed: start.elapsed(),
+                    },
+                );
+                err
+            })
+    }
+
+    /// Pins the object. On error, also returns how many slabs the indexer
+    /// had confirmed as pinned.
+    async fn pin_object_inner(&self, object: &Object) -> Result<(), (usize, Error)> {
         let slabs: Vec<SlabPinParams> = object
             .slabs()
             .iter()
@@ -420,17 +550,19 @@ impl Sdk {
             .collect();
 
         const BATCH_SIZE: usize = 50;
+        let mut pinned = 0;
         for batch in slabs.chunks(BATCH_SIZE) {
             self.api_client
                 .pin_slabs(&self.app_key.0, batch)
                 .await
-                .map_err(|e| Error::App(format!("{e:?}")))?;
+                .map_err(|e| (pinned, Error::App(format!("{e:?}"))))?;
+            pinned += batch.len();
         }
 
         self.api_client
             .pin_object(&self.app_key.0, &object.seal(self.app_key.as_ref()))
             .await
-            .map_err(|e| Error::App(format!("{e:?}")))?;
+            .map_err(|e| (pinned, Error::App(format!("{e:?}"))))?;
         Ok(())
     }
 

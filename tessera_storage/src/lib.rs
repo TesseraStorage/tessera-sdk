@@ -44,12 +44,14 @@ pub(crate) use compat::{task, time};
 use sia_core::rhp4::SECTOR_SIZE;
 use sia_core::signing::PrivateKey;
 
+mod agent_metadata;
 mod app_client;
 mod builder;
 mod congestion;
 mod download;
 mod encryption;
 mod erasure_coding;
+mod hooks;
 mod hosts;
 mod object_encryption;
 mod rhp4;
@@ -79,12 +81,16 @@ pub use sia_core::signing::{PublicKey, Signature};
 pub use sia_core::types::Hash256;
 pub use sia_core::types::v2::Protocol;
 
+pub use agent_metadata::{AGENT_METADATA_KEY, AgentMetadata, AgentMetadataError};
 pub use app_client::Error as AppApiError;
 pub use builder::{
     ApprovedState, Builder, BuilderError, DisconnectedState, RequestingApprovalState,
 };
 pub use download::{Download, DownloadError};
 pub use encryption::EncryptionKey;
+pub use hooks::{
+    AgentHooks, DownloadCompleteEvent, UploadCompleteEvent, WriteFailedEvent, WriteFailureStage,
+};
 pub use hosts::{QueueError, RPCError};
 pub use slabs::{
     Object, ObjectEvent, PinnedSlab, SealedObject, SealedObjectError, Sector, Slab, SlabVersion,
