@@ -596,7 +596,14 @@ fn default_memory_budget() -> u64 {
 }
 
 /// Estimates the on-network encoded size of data after erasure coding.
+///
+/// # Panics
+///
+/// Panics if `data_shards` is zero. Dividing by zero aborted Node and threw
+/// an opaque `unreachable` error in WASM; the panic message names the cause.
+/// Bindings check first and return an error instead of panicking.
 pub fn encoded_size(data_size: u64, data_shards: u8, parity_shards: u8) -> u64 {
+    assert!(data_shards != 0, "data shards cannot be zero");
     let total_shards = data_shards as u64 + parity_shards as u64;
     let sector_size = sia_core::rhp4::SECTOR_SIZE as u64;
     let slab_size = total_shards * sector_size;
@@ -635,6 +642,27 @@ mod test {
     use super::*;
 
     const OPTIMAL_DATA_SIZE: u64 = SECTOR_SIZE as u64 * 10; // 10 sectors per slab
+
+    #[test]
+    fn encoded_size_zero_data_shards_panics_with_a_clear_message() {
+        let panic = std::panic::catch_unwind(|| encoded_size(1 << 20, 0, 20)).unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("data shards cannot be zero"),
+            "opaque panic: {message}"
+        );
+    }
+
+    #[test]
+    fn encoded_size_of_zero_bytes_is_zero() {
+        // Callers (including tessera-web) depend on a zero-length object
+        // encoding to zero, not on an error.
+        assert_eq!(encoded_size(0, 10, 20), 0);
+    }
 
     fn random_seed() -> [u8; 32] {
         let mut seed = [0u8; 32];
