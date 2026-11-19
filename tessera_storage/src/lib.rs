@@ -599,16 +599,19 @@ fn default_memory_budget() -> u64 {
 ///
 /// # Panics
 ///
-/// Panics if `data_shards` is zero. Dividing by zero aborted Node and threw
-/// an opaque `unreachable` error in WASM; the panic message names the cause.
-/// Bindings check first and return an error instead of panicking.
+/// Panics if `data_shards` is zero, or if the encoded size does not fit in a
+/// `u64`. The return type stays `u64` so existing Rust callers keep compiling.
+/// Bindings check first and return an error instead of panicking: a panic
+/// aborts Node and is an opaque `unreachable` error in WASM.
 pub fn encoded_size(data_size: u64, data_shards: u8, parity_shards: u8) -> u64 {
     assert!(data_shards != 0, "data shards cannot be zero");
     let total_shards = data_shards as u64 + parity_shards as u64;
     let sector_size = sia_core::rhp4::SECTOR_SIZE as u64;
     let slab_size = total_shards * sector_size;
     let slabs = data_size.div_ceil(data_shards as u64 * sector_size);
-    slabs * slab_size
+    slabs
+        .checked_mul(slab_size)
+        .expect("encoded size does not fit in u64")
 }
 
 /// Generates a new BIP-39 12-word recovery phrase.
@@ -662,6 +665,42 @@ mod test {
         // Callers (including tessera-web) depend on a zero-length object
         // encoding to zero, not on an error.
         assert_eq!(encoded_size(0, 10, 20), 0);
+    }
+
+    #[test]
+    fn encoded_size_overflow_panics_with_a_clear_message() {
+        let sector_size = SECTOR_SIZE as u64;
+        assert_eq!(encoded_size(1, 10, 20), 30 * sector_size);
+        assert_eq!(
+            encoded_size(10 * sector_size + 1, 10, 20),
+            60 * sector_size
+        );
+        let panic = std::panic::catch_unwind(|| encoded_size(u64::MAX, 10, 20)).unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("encoded size does not fit in u64"),
+            "overflow wrapped or panicked opaquely: {message}"
+        );
+        let max_slabs = u64::MAX / (30 * sector_size);
+        assert_eq!(
+            encoded_size(max_slabs * 10 * sector_size, 10, 20),
+            max_slabs * 30 * sector_size
+        );
+        let panic = std::panic::catch_unwind(|| encoded_size(max_slabs * 10 * sector_size + 1, 10, 20))
+            .unwrap_err();
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            message.contains("encoded size does not fit in u64"),
+            "one byte past the max wrapped: {message}"
+        );
     }
 
     fn random_seed() -> [u8; 32] {

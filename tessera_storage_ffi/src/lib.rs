@@ -1193,7 +1193,18 @@ pub fn encoded_size(size: u64, data_shards: u8, parity_shards: u8) -> Result<u64
     if data_shards == 0 {
         return Err(Error::Custom("data shards cannot be zero".into()));
     }
+    if encoded_size_overflows(size, data_shards, parity_shards) {
+        return Err(Error::Custom("encoded size does not fit in u64".into()));
+    }
     Ok(tessera_storage::encoded_size(size, data_shards, parity_shards))
+}
+
+/// True when [`tessera_storage::encoded_size`] would panic on overflow.
+fn encoded_size_overflows(size: u64, data_shards: u8, parity_shards: u8) -> bool {
+    let sector_size = sia_core::rhp4::SECTOR_SIZE as u64;
+    let total_shards = data_shards as u64 + parity_shards as u64;
+    let slabs = size.div_ceil(data_shards as u64 * sector_size);
+    slabs.checked_mul(total_shards * sector_size).is_none()
 }
 
 #[cfg(test)]
@@ -1217,5 +1228,11 @@ mod encoded_size_tests {
     #[test]
     fn encoded_size_zero_bytes_is_zero() {
         assert_eq!(encoded_size(0, 10, 20).unwrap(), 0);
+    }
+
+    #[test]
+    fn encoded_size_rejects_overflow() {
+        let err = encoded_size(u64::MAX, 10, 20).unwrap_err();
+        assert!(err.to_string().contains("does not fit in u64"));
     }
 }
