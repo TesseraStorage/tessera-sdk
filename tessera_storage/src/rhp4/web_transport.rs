@@ -208,6 +208,20 @@ impl Stream {
             .map_err(|e| std::io::Error::other(js_err_message(&e)))?;
         Ok(())
     }
+
+    /// Writes `request`, then starts closing the sending side without
+    /// waiting for it. Hosts on coreutils 0.25.1 and later stop reading a
+    /// stream when an RPC ends, and if that reaches Firefox while this side
+    /// is still open, Firefox errors the readable side and the rest of the
+    /// response is lost.
+    async fn write_request(&self, request: &[u8]) -> Result<(), std::io::Error> {
+        self.write_all_async(request).await?;
+        let close = JsFuture::from(self.writer.close());
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = close.await;
+        });
+        Ok(())
+    }
 }
 
 /// Explicitly close both halves of the bidirectional stream when dropped.
@@ -354,7 +368,8 @@ impl Client {
 }
 
 // RPC writes: encode request into a Vec<u8> (instant — Vec impls AsyncWrite),
-// then send the whole buffer with write_all_async in one JS Promise.
+// then send the whole buffer with write_all_async in one JS Promise, and
+// close the writer.
 //
 // RPC reads: use AsyncRead on Stream directly. The JS reader.read() already
 // returns large chunks from the network buffer, which Stream stores in
@@ -367,7 +382,7 @@ impl Transport for Client {
             let mut buf = Vec::new();
             let req = RPCSettings::send_request(&mut buf).await?;
             let start = Instant::now();
-            stream.write_all_async(&buf).await?;
+            stream.write_request(&buf).await?;
             let resp = req.complete(&mut stream).await?;
             Ok((resp.settings.prices, start.elapsed()))
         }
@@ -394,7 +409,7 @@ impl Transport for Client {
             let mut buf = Vec::new();
             let req = RPCWriteSector::send_request(&mut buf, prices, token, data.clone()).await?;
             let start = Instant::now();
-            stream.write_all_async(&buf).await?;
+            stream.write_request(&buf).await?;
             let resp = req.complete(&mut stream).await?;
             Ok((resp.root, start.elapsed()))
         }
@@ -424,7 +439,7 @@ impl Transport for Client {
             let req =
                 RPCReadSector::send_request(&mut buf, prices, token, root, offset, length).await?;
             let start = Instant::now();
-            stream.write_all_async(&buf).await?;
+            stream.write_request(&buf).await?;
             let resp = req.complete(&mut stream).await?;
             Ok((resp.data, start.elapsed()))
         }
@@ -689,5 +704,28 @@ mod tests {
         let result = JsFuture::from(out_reader.read()).await.unwrap();
         let chunk: ReadableStreamReadResult = result.unchecked_into();
         assert_eq!(Uint8Array::new(&chunk.value()).to_vec(), b"pong");
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_write_request_closes_the_send_side() {
+        let (stream, _, out_reader) = test_stream();
+        stream.write_request(b"ping").await.unwrap();
+
+        let result = timeout(Duration::from_secs(1), JsFuture::from(out_reader.read()))
+            .await
+            .expect("request bytes")
+            .unwrap();
+        let chunk: ReadableStreamReadResult = result.unchecked_into();
+        assert_eq!(Uint8Array::new(&chunk.value()).to_vec(), b"ping");
+
+        // The next read is done because the writer was closed. Leaving the
+        // send side open hangs here: the host's STOP_SENDING then hits Firefox
+        // while this side is still open and drops the rest of the response.
+        let result = timeout(Duration::from_secs(1), JsFuture::from(out_reader.read()))
+            .await
+            .expect("send side stayed open")
+            .unwrap();
+        let chunk: ReadableStreamReadResult = result.unchecked_into();
+        assert!(chunk.is_done(), "send side stayed open");
     }
 }
