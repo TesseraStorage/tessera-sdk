@@ -100,6 +100,10 @@ struct AwaitingRecovery {
     /// duration of the RPC in `SlabRecovery::recover_shard` to ensure the
     /// reservation is released on completion or error.
     sectors: Vec<(SectorTask, Option<InflightGuard>)>,
+    /// How many shards the slab has. `sectors` can hold fewer, since sectors on
+    /// hosts the SDK has no address for are dropped, but each recovered shard
+    /// is stored at its index in the slab and decoding needs every position.
+    total_shards: usize,
     /// This chunk's position in download order. Compared against `popped`
     /// to decide whether the chunk is close enough to the read head to race.
     seq: usize,
@@ -162,6 +166,7 @@ impl SlabRecovery<AwaitingRecovery> {
             )));
         }
 
+        let total_shards = slab.slab.sectors.len();
         let mut sectors = slab
             .slab
             .sectors
@@ -174,6 +179,11 @@ impl SlabRecovery<AwaitingRecovery> {
             .collect::<Vec<_>>();
         client.prioritize(&mut sectors, |task| &task.sector.host_key);
 
+        let min_shards = slab.slab.min_shards as usize;
+        if sectors.len() < min_shards {
+            return Err(DownloadError::NotEnoughShards(sectors.len(), min_shards));
+        }
+
         // Reserve inflight slots for the top `min_shards` hosts now, while
         // we still hold the synchronous call frame. `Download::new` queues
         // many `SlabRecovery::new` calls back-to-back; without this, all of
@@ -181,7 +191,6 @@ impl SlabRecovery<AwaitingRecovery> {
         // snapshot and pile onto the same fastest hosts. The guards travel
         // into the spawned read tasks via `recover_shards` and drop with
         // them; failure/timeout retries reserve on demand from `remaining`.
-        let min_shards = slab.slab.min_shards as usize;
         let sectors = sectors
             .into_iter()
             .enumerate()
@@ -207,6 +216,7 @@ impl SlabRecovery<AwaitingRecovery> {
             length: slab.slab.length as usize,
             state: AwaitingRecovery {
                 sectors,
+                total_shards,
                 seq,
                 popped,
             },
@@ -272,7 +282,7 @@ impl SlabRecovery<AwaitingRecovery> {
         shard_downloaded: Option<ShardProgressCallback>,
     ) -> Result<SlabRecovery<ShardsRecovered>, DownloadError> {
         let mut shard_tasks = JoinSet::new();
-        let mut shards = vec![None; self.state.sectors.len()];
+        let mut shards = vec![None; self.state.total_shards];
         let mut sectors = VecDeque::from(std::mem::take(&mut self.state.sectors));
         let seq = self.state.seq;
         let mut popped_rx = self.state.popped.subscribe();
@@ -1144,6 +1154,140 @@ mod test {
                 "mismatch for case: {name}"
             );
         }
+    }
+
+    /// A sector whose host this SDK has no address for can never be read, so
+    /// the shortage is known before a single attempt.
+    #[sia_core_derive::cross_target_test]
+    async fn test_recovery_fails_immediately_when_hosts_are_unreachable() {
+        let hosts = Hosts::new(Client::mock());
+        let min_shards = 10usize;
+        let sectors: Vec<Sector> = (0..30)
+            .map(|i| Sector {
+                root: Hash256::new([i; 32]),
+                host_key: PrivateKey::from_seed(&rand::random()).public_key(),
+            })
+            .collect();
+        let err = SlabRecovery::new(
+            hosts,
+            Arc::new(InflightController::new(
+                INITIAL_INFLIGHT,
+                MIN_INFLIGHT,
+                100,
+                10,
+            )),
+            Arc::new(AppKey::import(rand::random())),
+            ChunkSlab {
+                slab: Slab {
+                    version: V1,
+                    encryption_key: rand::random::<[u8; 32]>().into(),
+                    min_shards: min_shards as u8,
+                    sectors,
+                    offset: 0,
+                    length: 1,
+                },
+                index: 0,
+                object_offset: 0,
+            },
+            0,
+            watch::channel(0).0,
+        )
+        .err()
+        .expect("unreachable hosts should fail before any read");
+        match err {
+            DownloadError::NotEnoughShards(have, need) => {
+                assert_eq!(have, 0, "no sector had a reachable host");
+                assert_eq!(need, min_shards);
+            }
+            e => panic!("expected NotEnoughShards, got {e:?}"),
+        }
+    }
+
+    #[sia_core_derive::cross_target_test]
+    async fn test_slab_recovery_with_an_unknown_host_keeps_shard_positions() {
+        let upload_options = UploadOptions::default();
+        let optimal_data_size = upload_options.data_shards as usize * SECTOR_SIZE;
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        let all_hosts: Vec<Host> = (0..60)
+            .map(|_| Host {
+                public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                addresses: vec![NetAddress {
+                    protocol: sia_core::types::v2::Protocol::QUIC,
+                    address: "localhost:1234".to_string(),
+                }],
+                country_code: "US".to_string(),
+                latitude: 0.0,
+                longitude: 0.0,
+                good_for_upload: true,
+            })
+            .collect();
+        hosts.update(all_hosts.clone(), true);
+        let mut data = BytesMut::zeroed(optimal_data_size);
+        rand::rng().fill_bytes(&mut data);
+        let data = data.freeze();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+        let obj = upload_object(
+            hosts.clone(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.clone()),
+            upload_options,
+        )
+        .await
+        .unwrap();
+        let slab = obj.slabs()[0].clone();
+        let sector_hosts: Vec<sia_core::signing::PublicKey> =
+            slab.sectors.iter().map(|s| s.host_key).collect();
+        let last = *sector_hosts.last().unwrap();
+
+        // The SDK no longer knows the host holding the first shard, as when a
+        // host map omits it, so the chunk has one sector fewer to read than it
+        // has shards. The host holding the last shard answers first, so its
+        // shard lands before any other.
+        hosts.update(
+            all_hosts
+                .into_iter()
+                .filter(|h| h.public_key != sector_hosts[0])
+                .collect(),
+            true,
+        );
+        transport.set_slow_hosts(
+            sector_hosts.iter().copied().filter(|k| *k != last),
+            Duration::from_millis(200),
+        );
+
+        let mut recovered_data = Vec::with_capacity(optimal_data_size);
+        SlabRecovery::new(
+            hosts.clone(),
+            Arc::new(InflightController::new(
+                INITIAL_INFLIGHT,
+                MIN_INFLIGHT,
+                100,
+                10,
+            )),
+            app_key.clone(),
+            ChunkSlab {
+                slab: slab.clone(),
+                index: 0,
+                object_offset: 0,
+            },
+            0,
+            watch::channel(0).0,
+        )
+        .unwrap()
+        .recover_shards(None)
+        .await
+        .unwrap()
+        .decode()
+        .unwrap()
+        .write(&mut recovered_data)
+        .await
+        .unwrap();
+        Chacha20Cipher::new_v1(obj.data_key.clone(), 0, &slab.encryption_key)
+            .apply_keystream(&mut recovered_data);
+        assert_eq!(&data[..], &recovered_data[..]);
     }
 
     #[sia_core_derive::cross_target_test]
