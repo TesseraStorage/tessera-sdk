@@ -671,10 +671,7 @@ mod test {
     fn encoded_size_overflow_panics_with_a_clear_message() {
         let sector_size = SECTOR_SIZE as u64;
         assert_eq!(encoded_size(1, 10, 20), 30 * sector_size);
-        assert_eq!(
-            encoded_size(10 * sector_size + 1, 10, 20),
-            60 * sector_size
-        );
+        assert_eq!(encoded_size(10 * sector_size + 1, 10, 20), 60 * sector_size);
         let panic = std::panic::catch_unwind(|| encoded_size(u64::MAX, 10, 20)).unwrap_err();
         let message = panic
             .downcast_ref::<String>()
@@ -690,8 +687,9 @@ mod test {
             encoded_size(max_slabs * 10 * sector_size, 10, 20),
             max_slabs * 30 * sector_size
         );
-        let panic = std::panic::catch_unwind(|| encoded_size(max_slabs * 10 * sector_size + 1, 10, 20))
-            .unwrap_err();
+        let panic =
+            std::panic::catch_unwind(|| encoded_size(max_slabs * 10 * sector_size + 1, 10, 20))
+                .unwrap_err();
         let message = panic
             .downcast_ref::<String>()
             .map(String::as_str)

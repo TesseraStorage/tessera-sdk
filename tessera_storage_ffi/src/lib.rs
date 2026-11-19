@@ -1196,7 +1196,11 @@ pub fn encoded_size(size: u64, data_shards: u8, parity_shards: u8) -> Result<u64
     if encoded_size_overflows(size, data_shards, parity_shards) {
         return Err(Error::Custom("encoded size does not fit in u64".into()));
     }
-    Ok(tessera_storage::encoded_size(size, data_shards, parity_shards))
+    Ok(tessera_storage::encoded_size(
+        size,
+        data_shards,
+        parity_shards,
+    ))
 }
 
 /// True when [`tessera_storage::encoded_size`] would panic on overflow.
