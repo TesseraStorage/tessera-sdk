@@ -662,7 +662,8 @@ impl Upload {
                 offset,
                 length: Some(len),
                 ..Default::default()
-            })?;
+            },
+        )?;
         self.read(data_key.clone(), download).await?;
         Ok(())
     }
@@ -1410,16 +1411,27 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(obj.size(), 1, "a zero-byte input must become a 1-byte object");
-        assert_eq!(obj.slabs().len(), 1, "indexd rejects zero slabs; there must be exactly one");
+        assert_eq!(
+            obj.size(),
+            1,
+            "a zero-byte input must become a 1-byte object"
+        );
+        assert_eq!(
+            obj.slabs().len(),
+            1,
+            "indexd rejects zero slabs; there must be exactly one"
+        );
 
         let mut recovered = Vec::new();
-        let mut download =
-            Download::new(&obj, hosts, app_key, DownloadOptions::default()).unwrap();
+        let mut download = Download::new(&obj, hosts, app_key, DownloadOptions::default()).unwrap();
         tokio::io::copy(&mut download, &mut recovered)
             .await
             .unwrap();
-        assert_eq!(recovered, vec![b'0'], "stored content must be exactly the ASCII \"0\" sentinel");
+        assert_eq!(
+            recovered,
+            vec![b'0'],
+            "stored content must be exactly the ASCII \"0\" sentinel"
+        );
     }
 
     /// Non-empty input is never touched by the sentinel substitution, byte
@@ -1444,8 +1456,7 @@ mod tests {
         assert_eq!(obj.size(), data.len() as u64);
 
         let mut recovered = Vec::new();
-        let mut download =
-            Download::new(&obj, hosts, app_key, DownloadOptions::default()).unwrap();
+        let mut download = Download::new(&obj, hosts, app_key, DownloadOptions::default()).unwrap();
         tokio::io::copy(&mut download, &mut recovered)
             .await
             .unwrap();

@@ -15,6 +15,8 @@ mod siamux;
 #[cfg(target_arch = "wasm32")]
 mod web_transport;
 
+mod dial_failures;
+
 #[cfg(any(test, feature = "mock"))]
 pub(crate) mod mock;
 
@@ -138,6 +140,9 @@ pub enum Error {
 
     #[error("transport error: {0}")]
     Transport(String),
+
+    #[error("WebTransport handshake refused: {0}")]
+    DialRefused(String),
 }
 
 /// A host endpoint contains the information needed to connect to a host.

@@ -1027,7 +1027,23 @@ impl Sdk {
 
 /// Calculates the encoded size of data given the original size and erasure coding parameters.
 #[napi]
-pub fn encoded_size(size: BigInt, data_shards: u8, parity_shards: u8) -> BigInt {
+pub fn encoded_size(size: BigInt, data_shards: u8, parity_shards: u8) -> Result<BigInt> {
+    // A Rust panic cannot unwind into JavaScript, so zero data shards would
+    // abort the whole Node process instead of throwing.
+    if data_shards == 0 {
+        return Err(Error::from_reason("data shards cannot be zero"));
+    }
     let (_, size, _) = size.get_u64();
-    tessera_storage::encoded_size(size, data_shards, parity_shards).into()
+    if encoded_size_overflows(size, data_shards, parity_shards) {
+        return Err(Error::from_reason("encoded size does not fit in u64"));
+    }
+    Ok(tessera_storage::encoded_size(size, data_shards, parity_shards).into())
+}
+
+/// True when [`tessera_storage::encoded_size`] would panic on overflow.
+fn encoded_size_overflows(size: u64, data_shards: u8, parity_shards: u8) -> bool {
+    let sector_size = sia_core::rhp4::SECTOR_SIZE as u64;
+    let total_shards = data_shards as u64 + parity_shards as u64;
+    let slabs = size.div_ceil(data_shards as u64 * sector_size);
+    slabs.checked_mul(total_shards * sector_size).is_none()
 }

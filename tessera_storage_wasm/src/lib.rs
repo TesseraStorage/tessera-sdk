@@ -79,6 +79,21 @@ pub fn validate_recovery_phrase(phrase: &str) -> Result<(), JsError> {
 
 /// Calculates the encoded size of data after erasure coding.
 #[wasm_bindgen(js_name = "encodedSize")]
-pub fn encoded_size(data_size: f64, data_shards: u8, parity_shards: u8) -> f64 {
-    tessera_storage::encoded_size(data_size as u64, data_shards, parity_shards) as f64
+pub fn encoded_size(data_size: f64, data_shards: u8, parity_shards: u8) -> Result<f64, JsError> {
+    if data_shards == 0 {
+        return Err(JsError::new("data shards cannot be zero"));
+    }
+    let data_size = data_size as u64;
+    if encoded_size_overflows(data_size, data_shards, parity_shards) {
+        return Err(JsError::new("encoded size does not fit in u64"));
+    }
+    Ok(tessera_storage::encoded_size(data_size, data_shards, parity_shards) as f64)
+}
+
+/// True when [`tessera_storage::encoded_size`] would panic on overflow.
+fn encoded_size_overflows(size: u64, data_shards: u8, parity_shards: u8) -> bool {
+    let sector_size = sia_core::rhp4::SECTOR_SIZE as u64;
+    let total_shards = data_shards as u64 + parity_shards as u64;
+    let slabs = size.div_ceil(data_shards as u64 * sector_size);
+    slabs.checked_mul(total_shards * sector_size).is_none()
 }

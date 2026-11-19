@@ -30,6 +30,7 @@ use wasm_bindgen_futures::JsFuture;
 
 use crate::time::{Duration, Instant, timeout};
 
+use super::dial_failures::DialFailures;
 use super::{Error, HostEndpoint, Transport};
 
 #[wasm_bindgen]
@@ -83,25 +84,51 @@ impl Drop for Connection {
 
 impl Connection {
     async fn open_stream(&self) -> Result<Stream, Error> {
-        let bidi: web_sys::WebTransportBidirectionalStream = timeout(
-            OPEN_STREAM_TIMEOUT,
-            JsFuture::from(self.transport.create_bidirectional_stream()),
-        )
-        .await
-        .map_err(|_| Error::Transport("createBidirectionalStream: timeout".into()))?
-        .map_err(|e| {
-            Error::Transport(format!("createBidirectionalStream: {}", js_err_message(&e)))
-        })?
-        .unchecked_into();
-        let reader = bidi
-            .readable()
-            .get_reader()
-            .unchecked_into::<web_sys::ReadableStreamDefaultReader>();
-        let writer = bidi
-            .writable()
-            .get_writer()
-            .map_err(|e| Error::Transport(format!("get_writer: {}", js_err_message(&e))))?;
-        Ok(Stream::new(reader, writer))
+        open_bidi_stream(self.transport.create_bidirectional_stream()).await
+    }
+}
+
+/// Waits for a `createBidirectionalStream` promise and wraps the result.
+async fn open_bidi_stream(
+    promise: js_sys::Promise<web_sys::WebTransportBidirectionalStream>,
+) -> Result<Stream, Error> {
+    let mut pending = PendingStream(Some(promise.clone()));
+    let bidi: web_sys::WebTransportBidirectionalStream =
+        timeout(OPEN_STREAM_TIMEOUT, JsFuture::from(promise))
+            .await
+            .map_err(|_| Error::Transport("createBidirectionalStream: timeout".into()))?
+            .map_err(|e| {
+                Error::Transport(format!("createBidirectionalStream: {}", js_err_message(&e)))
+            })?;
+    let reader = bidi
+        .readable()
+        .get_reader()
+        .unchecked_into::<web_sys::ReadableStreamDefaultReader>();
+    let writer = bidi
+        .writable()
+        .get_writer()
+        .map_err(|e| Error::Transport(format!("get_writer: {}", js_err_message(&e))))?;
+    pending.0 = None;
+    Ok(Stream::new(reader, writer))
+}
+
+/// Closes a stream whose open was abandoned. Without this, a stream that
+/// resolves after a timeout or a cancelled read stays open on the session.
+struct PendingStream(Option<js_sys::Promise<web_sys::WebTransportBidirectionalStream>>);
+
+impl Drop for PendingStream {
+    fn drop(&mut self) {
+        let Some(promise) = self.0.take() else {
+            return;
+        };
+        wasm_bindgen_futures::spawn_local(async move {
+            let Ok(bidi) = JsFuture::from(promise).await else {
+                return;
+            };
+            let write = JsFuture::from(bidi.writable().abort());
+            let read = JsFuture::from(bidi.readable().cancel());
+            let _ = tokio::join!(write, read);
+        });
     }
 }
 
@@ -117,7 +144,7 @@ async fn connect(addr: &str) -> Result<Connection, Error> {
 
     let options = web_sys::WebTransportOptions::new();
     let wt = web_sys::WebTransport::new_with_options(&url, &options).map_err(|e| {
-        Error::Transport(format!("WebTransport constructor: {}", js_err_message(&e)))
+        Error::DialRefused(format!("WebTransport constructor: {}", js_err_message(&e)))
     })?;
 
     let conn = Connection { transport: wt };
@@ -143,7 +170,7 @@ async fn connect(addr: &str) -> Result<Connection, Error> {
 
     JsFuture::from(conn.transport.ready())
         .await
-        .map_err(|e| Error::Transport(format!("WebTransport ready: {}", js_err_message(&e))))?;
+        .map_err(|e| Error::DialRefused(format!("WebTransport ready: {}", js_err_message(&e))))?;
 
     debug!("[WT] connected to {url}");
     Ok(conn)
@@ -180,6 +207,20 @@ impl Stream {
         JsFuture::from(self.writer.write_with_chunk(&array))
             .await
             .map_err(|e| std::io::Error::other(js_err_message(&e)))?;
+        Ok(())
+    }
+
+    /// Writes `request`, then starts closing the sending side without
+    /// waiting for it. Hosts on coreutils 0.25.1 and later stop reading a
+    /// stream when an RPC ends, and if that reaches Firefox while this side
+    /// is still open, Firefox errors the readable side and the rest of the
+    /// response is lost.
+    async fn write_request(&self, request: &[u8]) -> Result<(), std::io::Error> {
+        self.write_all_async(request).await?;
+        let close = JsFuture::from(self.writer.close());
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = close.await;
+        });
         Ok(())
     }
 }
@@ -249,6 +290,7 @@ type ConnCell = Rc<OnceCell<Rc<Connection>>>;
 pub struct Client {
     pool: Rc<RefCell<HashMap<PublicKey, ConnCell>>>,
     dial_sema: Rc<Semaphore>,
+    failures: Rc<RefCell<DialFailures>>,
 }
 
 impl Default for Client {
@@ -262,6 +304,7 @@ impl Client {
         Client {
             pool: Rc::new(RefCell::new(HashMap::new())),
             dial_sema: Rc::new(Semaphore::new(MAX_PENDING_CONNS)),
+            failures: Rc::new(RefCell::new(DialFailures::default())),
         }
     }
 
@@ -280,6 +323,33 @@ impl Client {
         };
         let conn = cell
             .get_or_try_init(|| async {
+                let now = Instant::now();
+                let quic_addrs: Vec<&str> = host
+                    .addresses
+                    .iter()
+                    .filter(|addr| addr.protocol == Protocol::QUIC)
+                    .map(|addr| addr.address.as_str())
+                    .collect();
+                if quic_addrs.is_empty() {
+                    return Err(Error::Transport(format!(
+                        "no QUIC/WebTransport address for host {}",
+                        host.public_key
+                    )));
+                }
+                let dialable: Vec<&str> = {
+                    let mut failures = self.failures.borrow_mut();
+                    quic_addrs
+                        .into_iter()
+                        .filter(|addr| !failures.in_backoff(addr, now))
+                        .collect()
+                };
+                if dialable.is_empty() {
+                    return Err(Error::DialRefused(format!(
+                        "every address of host {} refused a handshake in the last five minutes",
+                        host.public_key
+                    )));
+                }
+
                 // Gate concurrent dials to stay under Chrome's pending-connection cap.
                 let _permit = self
                     .dial_sema
@@ -287,16 +357,26 @@ impl Client {
                     .await
                     .map_err(|e| Error::Transport(format!("dial semaphore closed: {e}")))?;
 
-                // Connect to first available QUIC address
+                // Connect to first available QUIC address. A timeout is not
+                // recorded: Chrome can hold a healthy host back while it is
+                // counting earlier failures.
                 let mut last_err = None;
-                for addr in &host.addresses {
-                    if addr.protocol != Protocol::QUIC {
+                for addr in dialable {
+                    // Checked again after waiting for a dial slot, for an address
+                    // listed twice or refused while this dial waited.
+                    if self.failures.borrow_mut().in_backoff(addr, Instant::now()) {
+                        last_err = Some(Error::DialRefused(format!(
+                            "{addr} refused a handshake in the last five minutes"
+                        )));
                         continue;
                     }
-                    match connect(&addr.address).await {
+                    match connect(addr).await {
                         Ok(conn) => return Ok(Rc::new(conn)),
                         Err(e) => {
-                            debug!("[WT] connect to {} failed: {e}", addr.address);
+                            debug!("[WT] connect to {addr} failed: {e}");
+                            if matches!(e, Error::DialRefused(_)) {
+                                self.failures.borrow_mut().record(addr, Instant::now());
+                            }
                             last_err = Some(e);
                         }
                     }
@@ -328,7 +408,8 @@ impl Client {
 }
 
 // RPC writes: encode request into a Vec<u8> (instant — Vec impls AsyncWrite),
-// then send the whole buffer with write_all_async in one JS Promise.
+// then send the whole buffer with write_all_async in one JS Promise, and
+// close the writer.
 //
 // RPC reads: use AsyncRead on Stream directly. The JS reader.read() already
 // returns large chunks from the network buffer, which Stream stores in
@@ -341,7 +422,7 @@ impl Transport for Client {
             let mut buf = Vec::new();
             let req = RPCSettings::send_request(&mut buf).await?;
             let start = Instant::now();
-            stream.write_all_async(&buf).await?;
+            stream.write_request(&buf).await?;
             let resp = req.complete(&mut stream).await?;
             Ok((resp.settings.prices, start.elapsed()))
         }
@@ -368,7 +449,7 @@ impl Transport for Client {
             let mut buf = Vec::new();
             let req = RPCWriteSector::send_request(&mut buf, prices, token, data.clone()).await?;
             let start = Instant::now();
-            stream.write_all_async(&buf).await?;
+            stream.write_request(&buf).await?;
             let resp = req.complete(&mut stream).await?;
             Ok((resp.root, start.elapsed()))
         }
@@ -398,7 +479,7 @@ impl Transport for Client {
             let req =
                 RPCReadSector::send_request(&mut buf, prices, token, root, offset, length).await?;
             let start = Instant::now();
-            stream.write_all_async(&buf).await?;
+            stream.write_request(&buf).await?;
             let resp = req.complete(&mut stream).await?;
             Ok((resp.data, start.elapsed()))
         }
@@ -419,6 +500,63 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use wasm_bindgen_futures::spawn_local;
     use wasm_bindgen_test::*;
+
+    #[wasm_bindgen_test]
+    async fn test_refused_address_is_not_dialed_again() {
+        // The space makes the URL invalid, so the browser rejects the session at once.
+        let address = "not a host:9984";
+        let host = HostEndpoint {
+            public_key: PrivateKey::from_seed(&[1u8; 32]).public_key(),
+            addresses: vec![sia_core::types::v2::NetAddress {
+                protocol: Protocol::QUIC,
+                address: address.to_string(),
+            }],
+        };
+        let client = Client::new();
+
+        assert!(client.connection(&host).await.is_err());
+        assert!(
+            client
+                .failures
+                .borrow_mut()
+                .in_backoff(address, crate::time::Instant::now())
+        );
+        match client.connection(&host).await {
+            Err(Error::DialRefused(message)) => {
+                assert!(
+                    message.contains("in the last five minutes"),
+                    "the refused address was dialed again: {message}"
+                );
+            }
+            Err(e) => panic!("expected DialRefused, got {e}"),
+            Ok(_) => panic!("the refused address was dialed again"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_address_listed_twice_is_dialed_once() {
+        let address = "not a host either:9984";
+        let quic = || sia_core::types::v2::NetAddress {
+            protocol: Protocol::QUIC,
+            address: address.to_string(),
+        };
+        let host = HostEndpoint {
+            public_key: PrivateKey::from_seed(&[2u8; 32]).public_key(),
+            addresses: vec![quic(), quic()],
+        };
+        let client = Client::new();
+
+        // The second copy is skipped once the first is refused, so the error is the skip's.
+        let err = client
+            .connection(&host)
+            .await
+            .err()
+            .expect("the dial fails");
+        assert!(
+            err.to_string().contains("in the last five minutes"),
+            "the second copy was dialed: {err}"
+        );
+    }
 
     /// Creates a Stream backed by separate read/write TransformStreams.
     /// Returns (stream, feeder_for_reads, reader_for_writes).
@@ -579,5 +717,117 @@ mod tests {
         let mut buf = vec![0u8; 10];
         stream.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"helloworld");
+    }
+
+    /// Returns a stand-in for a `WebTransportBidirectionalStream` with the
+    /// feeder for its readable and the reader for its writable.
+    fn bidi_fixture() -> (
+        JsValue,
+        web_sys::WritableStreamDefaultWriter,
+        web_sys::ReadableStreamDefaultReader,
+    ) {
+        let read_ts = web_sys::TransformStream::new().unwrap();
+        let write_ts = web_sys::TransformStream::new().unwrap();
+        let bidi = js_sys::Object::new();
+        js_sys::Reflect::set(&bidi, &"readable".into(), &read_ts.readable()).unwrap();
+        js_sys::Reflect::set(&bidi, &"writable".into(), &write_ts.writable()).unwrap();
+        let feeder = read_ts.writable().get_writer().unwrap();
+        let out_reader = write_ts
+            .readable()
+            .get_reader()
+            .unchecked_into::<web_sys::ReadableStreamDefaultReader>();
+        (bidi.into(), feeder, out_reader)
+    }
+
+    /// Returns a promise that resolves to `bidi` once the sender fires.
+    fn deferred(
+        bidi: JsValue,
+    ) -> (
+        js_sys::Promise<web_sys::WebTransportBidirectionalStream>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let promise = wasm_bindgen_futures::future_to_promise(async move {
+            let _ = rx.await;
+            Ok(bidi)
+        });
+        (promise.unchecked_into(), tx)
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_abandoned_open_closes_late_stream() {
+        let (bidi, feeder, out_reader) = bidi_fixture();
+        let (promise, resolve) = deferred(bidi);
+        assert!(
+            timeout(Duration::from_millis(10), open_bidi_stream(promise))
+                .await
+                .is_err()
+        );
+        resolve.send(()).unwrap();
+
+        // Cancelling the readable errors its feeder; aborting the writable
+        // errors its reader.
+        assert!(
+            timeout(Duration::from_secs(1), JsFuture::from(feeder.closed()))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            timeout(Duration::from_secs(1), JsFuture::from(out_reader.closed()))
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_successful_open_keeps_stream() {
+        let (bidi, feeder, out_reader) = bidi_fixture();
+        let (promise, resolve) = deferred(bidi);
+        resolve.send(()).unwrap();
+        let mut stream = open_bidi_stream(promise).await.unwrap();
+        // Give a wrongly armed cleanup time to run.
+        crate::time::sleep(Duration::from_millis(50)).await;
+
+        feed_async(feeder, b"ping".to_vec());
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        spawn_local(async move {
+            stream.write_all_async(b"pong").await.unwrap();
+        });
+        let result = JsFuture::from(out_reader.read()).await.unwrap();
+        let chunk: ReadableStreamReadResult = result.unchecked_into();
+        assert_eq!(Uint8Array::new(&chunk.value()).to_vec(), b"pong");
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_write_request_closes_the_send_side() {
+        let (stream, _, out_reader) = test_stream();
+        // A browser TransformStream will not resolve `write()` until the
+        // readable side pulls. Awaiting the write first deadlocks the test
+        // (Node buffers the chunk and hides it). Read while the write runs.
+        spawn_local(async move {
+            stream.write_request(b"ping").await.unwrap();
+        });
+
+        let result = timeout(Duration::from_secs(1), JsFuture::from(out_reader.read()))
+            .await
+            .expect("request bytes")
+            .unwrap();
+        let chunk: ReadableStreamReadResult = result.unchecked_into();
+        assert_eq!(Uint8Array::new(&chunk.value()).to_vec(), b"ping");
+
+        // The next read is done because the writer was closed. Leaving the
+        // send side open hangs here: the host's STOP_SENDING then hits Firefox
+        // while this side is still open and drops the rest of the response.
+        let result = timeout(Duration::from_secs(1), JsFuture::from(out_reader.read()))
+            .await
+            .expect("send side stayed open")
+            .unwrap();
+        let chunk: ReadableStreamReadResult = result.unchecked_into();
+        assert!(chunk.is_done(), "send side stayed open");
     }
 }
