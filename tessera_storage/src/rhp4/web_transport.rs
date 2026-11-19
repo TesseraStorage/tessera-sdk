@@ -806,7 +806,12 @@ mod tests {
     #[wasm_bindgen_test]
     async fn test_write_request_closes_the_send_side() {
         let (stream, _, out_reader) = test_stream();
-        stream.write_request(b"ping").await.unwrap();
+        // A browser TransformStream will not resolve `write()` until the
+        // readable side pulls. Awaiting the write first deadlocks the test
+        // (Node buffers the chunk and hides it). Read while the write runs.
+        spawn_local(async move {
+            stream.write_request(b"ping").await.unwrap();
+        });
 
         let result = timeout(Duration::from_secs(1), JsFuture::from(out_reader.read()))
             .await
