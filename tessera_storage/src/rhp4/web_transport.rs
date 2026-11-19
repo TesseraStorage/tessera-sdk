@@ -30,6 +30,7 @@ use wasm_bindgen_futures::JsFuture;
 
 use crate::time::{Duration, Instant, timeout};
 
+use super::dial_failures::DialFailures;
 use super::{Error, HostEndpoint, Transport};
 
 #[wasm_bindgen]
@@ -143,7 +144,7 @@ async fn connect(addr: &str) -> Result<Connection, Error> {
 
     let options = web_sys::WebTransportOptions::new();
     let wt = web_sys::WebTransport::new_with_options(&url, &options).map_err(|e| {
-        Error::Transport(format!("WebTransport constructor: {}", js_err_message(&e)))
+        Error::DialRefused(format!("WebTransport constructor: {}", js_err_message(&e)))
     })?;
 
     let conn = Connection { transport: wt };
@@ -169,7 +170,7 @@ async fn connect(addr: &str) -> Result<Connection, Error> {
 
     JsFuture::from(conn.transport.ready())
         .await
-        .map_err(|e| Error::Transport(format!("WebTransport ready: {}", js_err_message(&e))))?;
+        .map_err(|e| Error::DialRefused(format!("WebTransport ready: {}", js_err_message(&e))))?;
 
     debug!("[WT] connected to {url}");
     Ok(conn)
@@ -289,6 +290,7 @@ type ConnCell = Rc<OnceCell<Rc<Connection>>>;
 pub struct Client {
     pool: Rc<RefCell<HashMap<PublicKey, ConnCell>>>,
     dial_sema: Rc<Semaphore>,
+    failures: Rc<RefCell<DialFailures>>,
 }
 
 impl Default for Client {
@@ -302,6 +304,7 @@ impl Client {
         Client {
             pool: Rc::new(RefCell::new(HashMap::new())),
             dial_sema: Rc::new(Semaphore::new(MAX_PENDING_CONNS)),
+            failures: Rc::new(RefCell::new(DialFailures::default())),
         }
     }
 
@@ -320,6 +323,33 @@ impl Client {
         };
         let conn = cell
             .get_or_try_init(|| async {
+                let now = Instant::now();
+                let quic_addrs: Vec<&str> = host
+                    .addresses
+                    .iter()
+                    .filter(|addr| addr.protocol == Protocol::QUIC)
+                    .map(|addr| addr.address.as_str())
+                    .collect();
+                if quic_addrs.is_empty() {
+                    return Err(Error::Transport(format!(
+                        "no QUIC/WebTransport address for host {}",
+                        host.public_key
+                    )));
+                }
+                let dialable: Vec<&str> = {
+                    let mut failures = self.failures.borrow_mut();
+                    quic_addrs
+                        .into_iter()
+                        .filter(|addr| !failures.in_backoff(addr, now))
+                        .collect()
+                };
+                if dialable.is_empty() {
+                    return Err(Error::DialRefused(format!(
+                        "every address of host {} refused a handshake in the last five minutes",
+                        host.public_key
+                    )));
+                }
+
                 // Gate concurrent dials to stay under Chrome's pending-connection cap.
                 let _permit = self
                     .dial_sema
@@ -327,16 +357,26 @@ impl Client {
                     .await
                     .map_err(|e| Error::Transport(format!("dial semaphore closed: {e}")))?;
 
-                // Connect to first available QUIC address
+                // Connect to first available QUIC address. A timeout is not
+                // recorded: Chrome can hold a healthy host back while it is
+                // counting earlier failures.
                 let mut last_err = None;
-                for addr in &host.addresses {
-                    if addr.protocol != Protocol::QUIC {
+                for addr in dialable {
+                    // Checked again after waiting for a dial slot, for an address
+                    // listed twice or refused while this dial waited.
+                    if self.failures.borrow_mut().in_backoff(addr, Instant::now()) {
+                        last_err = Some(Error::DialRefused(format!(
+                            "{addr} refused a handshake in the last five minutes"
+                        )));
                         continue;
                     }
-                    match connect(&addr.address).await {
+                    match connect(addr).await {
                         Ok(conn) => return Ok(Rc::new(conn)),
                         Err(e) => {
-                            debug!("[WT] connect to {} failed: {e}", addr.address);
+                            debug!("[WT] connect to {addr} failed: {e}");
+                            if matches!(e, Error::DialRefused(_)) {
+                                self.failures.borrow_mut().record(addr, Instant::now());
+                            }
                             last_err = Some(e);
                         }
                     }
@@ -460,6 +500,63 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use wasm_bindgen_futures::spawn_local;
     use wasm_bindgen_test::*;
+
+    #[wasm_bindgen_test]
+    async fn test_refused_address_is_not_dialed_again() {
+        // The space makes the URL invalid, so the browser rejects the session at once.
+        let address = "not a host:9984";
+        let host = HostEndpoint {
+            public_key: PrivateKey::from_seed(&[1u8; 32]).public_key(),
+            addresses: vec![sia_core::types::v2::NetAddress {
+                protocol: Protocol::QUIC,
+                address: address.to_string(),
+            }],
+        };
+        let client = Client::new();
+
+        assert!(client.connection(&host).await.is_err());
+        assert!(
+            client
+                .failures
+                .borrow_mut()
+                .in_backoff(address, crate::time::Instant::now())
+        );
+        match client.connection(&host).await {
+            Err(Error::DialRefused(message)) => {
+                assert!(
+                    message.contains("in the last five minutes"),
+                    "the refused address was dialed again: {message}"
+                );
+            }
+            Err(e) => panic!("expected DialRefused, got {e}"),
+            Ok(_) => panic!("the refused address was dialed again"),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn test_address_listed_twice_is_dialed_once() {
+        let address = "not a host either:9984";
+        let quic = || sia_core::types::v2::NetAddress {
+            protocol: Protocol::QUIC,
+            address: address.to_string(),
+        };
+        let host = HostEndpoint {
+            public_key: PrivateKey::from_seed(&[2u8; 32]).public_key(),
+            addresses: vec![quic(), quic()],
+        };
+        let client = Client::new();
+
+        // The second copy is skipped once the first is refused, so the error is the skip's.
+        let err = client
+            .connection(&host)
+            .await
+            .err()
+            .expect("the dial fails");
+        assert!(
+            err.to_string().contains("in the last five minutes"),
+            "the second copy was dialed: {err}"
+        );
+    }
 
     /// Creates a Stream backed by separate read/write TransformStreams.
     /// Returns (stream, feeder_for_reads, reader_for_writes).
