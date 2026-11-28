@@ -15,7 +15,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tessera_storage::{
-    AppKey, AppMetadata, Builder, DownloadOptions, Object, Sdk, UploadOptions,
+    AppKey, AppMetadata, Builder, DownloadOptions, Object, Sdk, ShardFailure, UploadOptions,
     generate_recovery_phrase,
 };
 use tokio::fs;
@@ -81,6 +81,15 @@ enum Command {
         /// Print a per-host breakdown of shards and throughput after the run.
         #[arg(long)]
         host_summary: bool,
+
+        /// Write a JSON report of every shard refusal (host low on funds,
+        /// timeout, etc.) encountered during the download -- including ones
+        /// recovered via substitution -- to this path. Includes the raw
+        /// events plus a summary: peak refusals in any single slab, and
+        /// refusal counts bucketed into 2-minute funding-cycle windows
+        /// (indexd's maintenanceFrequency) measured from download start.
+        #[arg(long)]
+        shard_failures_report: Option<PathBuf>,
     },
     /// List configured profiles.
     Profiles,
@@ -465,6 +474,7 @@ async fn run_benchmark(
     mut upload_options: UploadOptions,
     mut download_options: DownloadOptions,
     host_summary: bool,
+    shard_failures_report: Option<PathBuf>,
 ) {
     let seed: u64 = rand::random();
     let reader = SeededReader::new(seed, size);
@@ -512,6 +522,23 @@ async fn run_benchmark(
             p.elapsed,
         );
     });
+
+    // Shard-refusal telemetry (added 2026-11-28 for the funding-floor
+    // trial): every host refusal/failure during the download, timestamped
+    // relative to download start so refusals can be bucketed into
+    // funding-cycle windows after the fact.
+    let failures: Arc<Mutex<Vec<(Duration, ShardFailure)>>> = Arc::new(Mutex::new(Vec::new()));
+    let download_start_marker = Instant::now();
+    if shard_failures_report.is_some() {
+        let failures_cb = failures.clone();
+        download_options = download_options.on_shard_failed(move |f: ShardFailure| {
+            failures_cb
+                .lock()
+                .unwrap()
+                .push((download_start_marker.elapsed(), f));
+        });
+    }
+
     let download_progress = progress_bar(size as u64, "download");
     let start = Instant::now();
     let mut verifier = SeededVerifier::new(seed, size, download_progress.clone());
@@ -557,6 +584,230 @@ async fn run_benchmark(
         print_host_summary("Upload", &upload_hosts);
         print_host_summary("Download", &download_hosts);
     }
+
+    if let Some(path) = shard_failures_report {
+        if let Err(e) = write_shard_failures_report(&path, &failures, download_duration) {
+            eprintln!("failed to write shard failures report to {path:?}: {e}");
+        } else {
+            println!("\nShard failures report written to {}", path.display());
+        }
+    }
+}
+
+/// Funding cycle window used by indexd's maintenance loop
+/// (`maintenanceFrequency: 2 * time.Minute`, contracts/manager.go). Used
+/// to bucket refusal events into cycle windows for peak-depletion analysis.
+const FUNDING_CYCLE: Duration = Duration::from_secs(120);
+
+#[derive(Serialize)]
+struct ShardFailureEvent {
+    host_key: String,
+    shard_index: usize,
+    slab_index: usize,
+    since_download_start_ms: u128,
+    funding_cycle: u64,
+    elapsed_ms: u128,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct CycleBucket {
+    funding_cycle: u64,
+    refusal_count: usize,
+    distinct_hosts_refused: usize,
+}
+
+#[derive(Serialize)]
+struct ShardFailuresReport {
+    download_duration_ms: u128,
+    total_refusals: usize,
+    distinct_hosts_refused: usize,
+    /// The highest number of refusals observed for any single slab -- the
+    /// number you get by asking "which slab had the worst time getting to
+    /// min_shards successes".
+    peak_refusals_per_slab: usize,
+    /// slab_index of the slab that hit peak_refusals_per_slab (first one,
+    /// if tied).
+    peak_slab_index: Option<usize>,
+    /// Refusals bucketed into 2-minute funding-cycle windows (cycle 0 =
+    /// the first 2 minutes of the download, etc.). The cycle with the
+    /// highest refusal_count is the empirical "max depletion within one
+    /// funding cycle" for this run.
+    cycle_buckets: Vec<CycleBucket>,
+    events: Vec<ShardFailureEvent>,
+}
+
+fn write_shard_failures_report(
+    path: &std::path::Path,
+    failures: &Arc<Mutex<Vec<(Duration, ShardFailure)>>>,
+    download_duration: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let failures = failures.lock().unwrap();
+
+    let mut per_slab: HashMap<usize, usize> = HashMap::new();
+    let mut per_cycle: BTreeMap<u64, (usize, std::collections::HashSet<String>)> =
+        BTreeMap::new();
+    let mut distinct_hosts: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut events = Vec::with_capacity(failures.len());
+
+    for (since_start, f) in failures.iter() {
+        let cycle = since_start.as_secs() / FUNDING_CYCLE.as_secs();
+        *per_slab.entry(f.slab_index).or_default() += 1;
+        let entry = per_cycle.entry(cycle).or_default();
+        entry.0 += 1;
+        entry.1.insert(f.host_key.to_string());
+        distinct_hosts.insert(f.host_key.to_string());
+        events.push(ShardFailureEvent {
+            host_key: f.host_key.to_string(),
+            shard_index: f.shard_index,
+            slab_index: f.slab_index,
+            since_download_start_ms: since_start.as_millis(),
+            funding_cycle: cycle,
+            elapsed_ms: f.elapsed.as_millis(),
+            error: f.error.clone(),
+        });
+    }
+
+    let (peak_slab_index, peak_refusals_per_slab) = per_slab
+        .iter()
+        .max_by_key(|(_, count)| **count)
+        .map(|(slab, count)| (Some(*slab), *count))
+        .unwrap_or((None, 0));
+
+    let cycle_buckets = per_cycle
+        .into_iter()
+        .map(|(funding_cycle, (refusal_count, hosts))| CycleBucket {
+            funding_cycle,
+            refusal_count,
+            distinct_hosts_refused: hosts.len(),
+        })
+        .collect();
+
+    let report = ShardFailuresReport {
+        download_duration_ms: download_duration.as_millis(),
+        total_refusals: events.len(),
+        distinct_hosts_refused: distinct_hosts.len(),
+        peak_refusals_per_slab,
+        peak_slab_index,
+        cycle_buckets,
+        events,
+    };
+
+    let json = serde_json::to_string_pretty(&report)?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod shard_failures_report_tests {
+    use super::*;
+
+    #[test]
+    fn peak_and_cycle_bucketing() {
+        let failures = Arc::new(Mutex::new(vec![
+            // cycle 0 (0-120s): slab 0 refused by 2 different hosts
+            (
+                Duration::from_secs(10),
+                ShardFailure {
+                    host_key: sia_core::signing::PrivateKey::from_seed(&[1; 32]).public_key(),
+                    shard_index: 3,
+                    slab_index: 0,
+                    elapsed: Duration::from_millis(50),
+                    error: "insufficient funds".to_string(),
+                },
+            ),
+            (
+                Duration::from_secs(20),
+                ShardFailure {
+                    host_key: sia_core::signing::PrivateKey::from_seed(&[2; 32]).public_key(),
+                    shard_index: 7,
+                    slab_index: 0,
+                    elapsed: Duration::from_millis(60),
+                    error: "insufficient funds".to_string(),
+                },
+            ),
+            // cycle 1 (120-240s): slab 1 refused by 3 different hosts --
+            // this is the real peak (3 > 2).
+            (
+                Duration::from_secs(125),
+                ShardFailure {
+                    host_key: sia_core::signing::PrivateKey::from_seed(&[3; 32]).public_key(),
+                    shard_index: 1,
+                    slab_index: 1,
+                    elapsed: Duration::from_millis(40),
+                    error: "insufficient funds".to_string(),
+                },
+            ),
+            (
+                Duration::from_secs(130),
+                ShardFailure {
+                    host_key: sia_core::signing::PrivateKey::from_seed(&[4; 32]).public_key(),
+                    shard_index: 2,
+                    slab_index: 1,
+                    elapsed: Duration::from_millis(45),
+                    error: "insufficient funds".to_string(),
+                },
+            ),
+            (
+                Duration::from_secs(135),
+                ShardFailure {
+                    // same host as cycle 0's first failure -- distinct-host
+                    // counting must still be correct per-cycle, not just
+                    // globally.
+                    host_key: sia_core::signing::PrivateKey::from_seed(&[1; 32]).public_key(),
+                    shard_index: 4,
+                    slab_index: 1,
+                    elapsed: Duration::from_millis(55),
+                    error: "insufficient funds".to_string(),
+                },
+            ),
+        ]));
+
+        let path = std::env::temp_dir().join(format!(
+            "shard_failures_test_{}.json",
+            std::process::id()
+        ));
+        write_shard_failures_report(&path, &failures, Duration::from_secs(300)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let report: ShardFailuresReportTest = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(report.total_refusals, 5);
+        assert_eq!(report.distinct_hosts_refused, 4, "hosts seeded 1,2,3,4 -- host 1 repeats");
+        assert_eq!(
+            report.peak_refusals_per_slab, 3,
+            "slab 1 has 3 refusals, slab 0 has 2 -- peak must be 3"
+        );
+        assert_eq!(report.peak_slab_index, Some(1));
+        assert_eq!(report.cycle_buckets.len(), 2, "events fall in cycle 0 and cycle 1 only");
+        assert_eq!(report.cycle_buckets[0].funding_cycle, 0);
+        assert_eq!(report.cycle_buckets[0].refusal_count, 2);
+        assert_eq!(report.cycle_buckets[0].distinct_hosts_refused, 2);
+        assert_eq!(report.cycle_buckets[1].funding_cycle, 1);
+        assert_eq!(report.cycle_buckets[1].refusal_count, 3);
+        assert_eq!(
+            report.cycle_buckets[1].distinct_hosts_refused, 3,
+            "cycle 1 has 3 events but host [1;32] repeats cycle 0's host -- within cycle 1 itself all 3 hosts (3,4,1) are distinct"
+        );
+    }
+
+    // Local mirror of the real report shape for deserializing in the test
+    // without needing to make every field of the real structs `pub(crate)`.
+    #[derive(serde::Deserialize)]
+    struct ShardFailuresReportTest {
+        total_refusals: usize,
+        distinct_hosts_refused: usize,
+        peak_refusals_per_slab: usize,
+        peak_slab_index: Option<usize>,
+        cycle_buckets: Vec<CycleBucketTest>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CycleBucketTest {
+        funding_cycle: u64,
+        refusal_count: usize,
+        distinct_hosts_refused: usize,
+    }
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -581,6 +832,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             upload_max_buffered_slabs,
             download_max_buffered_chunks,
             host_summary,
+            shard_failures_report,
         } => {
             let sdk = connect(&cli.profile).await?;
 
@@ -608,7 +860,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .await?;
             }
 
-            run_benchmark(sdk, size, upload_options, download_options, host_summary).await;
+            run_benchmark(
+                sdk,
+                size,
+                upload_options,
+                download_options,
+                host_summary,
+                shard_failures_report,
+            )
+            .await;
             Ok(())
         }
         Command::Profiles => list_profiles().await,
