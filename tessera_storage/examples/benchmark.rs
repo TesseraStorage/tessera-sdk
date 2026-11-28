@@ -492,6 +492,52 @@ async fn warmup(
     Ok(())
 }
 
+/// Runs the actual download body (fetch reader + copy to `output` or
+/// discard), returning the number of bytes actually received. Split out of
+/// `download_only` so the caller can flush the shard-failures report on
+/// either outcome, not just success.
+async fn run_download_body(
+    sdk: &Sdk,
+    obj: &Object,
+    download_options: DownloadOptions,
+    output: Option<PathBuf>,
+) -> Result<u64, Box<dyn Error>> {
+    let mut reader = sdk.download(obj, download_options).await?;
+    let bytes_written: u64 = match output {
+        Some(path) => {
+            let mut file = fs::File::create(&path).await?;
+            copy(&mut reader, &mut file).await?
+        }
+        None => {
+            // Discard, but still track total bytes via a counting sink.
+            struct CountingSink(u64);
+            impl AsyncWrite for CountingSink {
+                fn poll_write(
+                    mut self: Pin<&mut Self>,
+                    _: &mut Context<'_>,
+                    buf: &[u8],
+                ) -> Poll<std::io::Result<usize>> {
+                    self.0 += buf.len() as u64;
+                    Poll::Ready(Ok(buf.len()))
+                }
+                fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+                fn poll_shutdown(
+                    self: Pin<&mut Self>,
+                    _: &mut Context<'_>,
+                ) -> Poll<std::io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            let mut sink = CountingSink(0);
+            copy(&mut reader, &mut sink).await?;
+            sink.0
+        }
+    };
+    Ok(bytes_written)
+}
+
 async fn download_only(
     sdk: Sdk,
     object_key: Hash256,
@@ -528,44 +574,22 @@ async fn download_only(
 
     let download_progress = progress_bar(obj.size(), "download");
     let start = Instant::now();
-    let mut reader = sdk.download(&obj, download_options).await?;
-
-    let bytes_written: u64 = match output {
-        Some(path) => {
-            let mut file = fs::File::create(&path).await?;
-            copy(&mut reader, &mut file).await?
-        }
-        None => {
-            // Discard, but still track total bytes via a counting sink so
-            // the progress bar and final rate are accurate.
-            struct CountingSink(u64, ProgressBar);
-            impl AsyncWrite for CountingSink {
-                fn poll_write(
-                    mut self: Pin<&mut Self>,
-                    _: &mut Context<'_>,
-                    buf: &[u8],
-                ) -> Poll<std::io::Result<usize>> {
-                    self.0 += buf.len() as u64;
-                    self.1.set_position(self.0);
-                    Poll::Ready(Ok(buf.len()))
-                }
-                fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-                    Poll::Ready(Ok(()))
-                }
-                fn poll_shutdown(
-                    self: Pin<&mut Self>,
-                    _: &mut Context<'_>,
-                ) -> Poll<std::io::Result<()>> {
-                    Poll::Ready(Ok(()))
-                }
-            }
-            let mut sink = CountingSink(0, download_progress.clone());
-            copy(&mut reader, &mut sink).await?;
-            sink.0
-        }
-    };
+    let result = run_download_body(&sdk, &obj, download_options, output).await;
     let download_duration = start.elapsed();
     download_progress.finish();
+
+    // Flush whatever refusal telemetry we collected regardless of outcome --
+    // this is most valuable exactly when the download fails, since it's the
+    // only record of which host(s)/slab/cycle caused it.
+    if let Some(path) = &shard_failures_report {
+        if let Err(e) = write_shard_failures_report(path, &failures, download_duration) {
+            eprintln!("warning: failed to write shard failures report: {e}");
+        } else {
+            println!("\nShard failures report written to {}", path.display());
+        }
+    }
+
+    let bytes_written = result?;
 
     if bytes_written != obj.size() {
         return Err(format!(
