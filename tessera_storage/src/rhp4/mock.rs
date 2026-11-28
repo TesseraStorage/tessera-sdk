@@ -19,6 +19,10 @@ pub struct Client {
     /// simulate out-of-order chunk completion.
     read_delays: Arc<RwLock<HashMap<Hash256, Duration>>>,
     initial_read_delay: Arc<RwLock<Option<Duration>>>,
+    /// Hosts that fail every `read_sector` call with a fixed error, used to
+    /// test the `ShardFailure` callback / substitution path end-to-end
+    /// (added 2026-11-28 for the funding-floor refusal-telemetry work).
+    failing_read_hosts: Arc<RwLock<HashSet<PublicKey>>>,
 }
 
 impl Default for Client {
@@ -35,6 +39,7 @@ impl Client {
             slow_delay: Arc::new(RwLock::new(Duration::ZERO)),
             read_delays: Arc::new(RwLock::new(HashMap::new())),
             initial_read_delay: Arc::new(RwLock::new(None)),
+            failing_read_hosts: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -57,6 +62,18 @@ impl Client {
         slow.clear();
         slow.extend(hosts);
         *self.slow_delay.write().unwrap() = delay;
+    }
+
+    /// Makes `read_sector` fail every call for the given hosts with a fixed
+    /// "insufficient funds" style error, simulating a host refusing a shard
+    /// read because the account's balance on it is depleted. Used to test
+    /// the `ShardFailure` callback path (substitution onto a different
+    /// shard/host within the same slab) end-to-end.
+    #[allow(dead_code)] // used in tests
+    pub fn set_failing_read_hosts(&self, hosts: impl IntoIterator<Item = PublicKey>) {
+        let mut failing = self.failing_read_hosts.write().unwrap();
+        failing.clear();
+        failing.extend(hosts);
     }
 
     /// Clears all slow host settings.
@@ -129,6 +146,16 @@ impl Transport for Client {
     ) -> Result<(Bytes, Duration), RHP4Error> {
         if host.addresses.is_empty() {
             return Err(RHP4Error::Transport("host has no addresses".to_string()));
+        }
+        if self
+            .failing_read_hosts
+            .read()
+            .unwrap()
+            .contains(&host.public_key)
+        {
+            return Err(RHP4Error::Transport(
+                "insufficient funds: account balance below marginal read cost".to_string(),
+            ));
         }
         let start = Instant::now();
         // Check if this host is configured as slow

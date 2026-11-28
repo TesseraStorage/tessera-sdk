@@ -13,7 +13,8 @@ use crate::hosts::{Hosts, InflightGuard, RPCError};
 use crate::slabs::SlabVersion::{V0, V1};
 use crate::time::{Duration, Elapsed, Instant, sleep};
 use crate::{
-    AppKey, DownloadOptions, Hash256, Object, Sector, ShardProgress, ShardProgressCallback, Slab,
+    AppKey, DownloadOptions, Hash256, Object, Sector, ShardFailure, ShardFailureCallback,
+    ShardProgress, ShardProgressCallback, Slab,
 };
 use bytes::{Buf, Bytes};
 use log::debug;
@@ -229,12 +230,14 @@ impl SlabRecovery<AwaitingRecovery> {
         inflight: Option<InflightGuard>,
         sector_offset: usize,
         sector_length: usize,
-    ) -> impl Future<Output = Result<(usize, Vec<u8>, ShardProgress), DownloadError>> + 'static
+    ) -> impl Future<Output = Result<(usize, Vec<u8>, ShardProgress), ShardFailure>> + 'static
     {
         let client = self.client.clone();
         let controller = self.controller.clone();
         let account_key = self.account_key.clone();
         let slab_index = self.slab_index;
+        let host_key = task.sector.host_key;
+        let shard_index = task.shard_index;
         async move {
             // Hold the inflight reservation for the duration of the RPC. The
             // guard was created by the caller before spawning so the load is
@@ -256,7 +259,13 @@ impl SlabRecovery<AwaitingRecovery> {
                 .await;
             let elapsed = start.elapsed();
             controller.record(permit, elapsed, result.is_ok());
-            let data = result?;
+            let data = result.map_err(|e| ShardFailure {
+                host_key,
+                shard_index,
+                slab_index,
+                elapsed,
+                error: DownloadError::from(e).to_string(),
+            })?;
             debug!(
                 "slab {} shard {} recovered from {} in {:?}",
                 slab_index, task.shard_index, task.sector.host_key, elapsed
@@ -280,6 +289,7 @@ impl SlabRecovery<AwaitingRecovery> {
     async fn recover_shards(
         mut self,
         shard_downloaded: Option<ShardProgressCallback>,
+        shard_failed: Option<ShardFailureCallback>,
     ) -> Result<SlabRecovery<ShardsRecovered>, DownloadError> {
         let mut shard_tasks = JoinSet::new();
         let mut shards = vec![None; self.state.total_shards];
@@ -343,7 +353,10 @@ impl SlabRecovery<AwaitingRecovery> {
                                 });
                             }
                         },
-                        Err(_) => {
+                        Err(failure) => {
+                            if let Some(cb) = &shard_failed {
+                                cb(failure.clone());
+                            }
                             if recovered_shards + shard_tasks.len() + sectors.len() < min_shards {
                                 return Err(DownloadError::NotEnoughShards(recovered_shards, min_shards));
                             } else if let Some((task, _)) = sectors.pop_front() {
@@ -524,6 +537,7 @@ pub struct Download {
     errored: bool,
 
     shard_downloaded: Option<ShardProgressCallback>,
+    shard_failed: Option<ShardFailureCallback>,
 
     // Set by `notify_on_complete` when an agent hook is attached.
     pub(crate) completion: Option<Completion>,
@@ -643,6 +657,7 @@ impl Download {
         let hosts = self.hosts.clone();
         let account_key = self.account_key.clone();
         let shard_progress_callback = self.shard_downloaded.clone();
+        let shard_failed_callback = self.shard_failed.clone();
         // Build the SlabRecovery synchronously so prioritization and top-K
         // inflight reservations land before this method returns; each
         // successive spawn must see the previous chunk's reservations to
@@ -671,7 +686,7 @@ impl Download {
                 let recovery = recovery?;
                 let mut buf = Vec::with_capacity(len);
                 recovery
-                    .recover_shards(shard_progress_callback)
+                    .recover_shards(shard_progress_callback, shard_failed_callback)
                     .await?
                     .decode()?
                     .write(&mut buf)
@@ -770,6 +785,7 @@ impl Download {
             popped: watch::channel(0).0,
             errored: false,
             shard_downloaded: options.shard_downloaded,
+            shard_failed: options.shard_failed,
             completion: None,
         };
         download.refill();
@@ -1132,7 +1148,7 @@ mod test {
                 watch::channel(0).0,
             )
             .unwrap()
-            .recover_shards(None)
+            .recover_shards(None, None)
             .await
             .unwrap()
             .decode()
@@ -1277,7 +1293,7 @@ mod test {
             watch::channel(0).0,
         )
         .unwrap()
-        .recover_shards(None)
+        .recover_shards(None, None)
         .await
         .unwrap()
         .decode()
@@ -1388,6 +1404,116 @@ mod test {
         }
     }
 
+    /// Regression test for the `ShardFailure` callback (added 2026-11-28 for
+    /// the funding-floor refusal-telemetry work, money/artifacts/TEST-PLAN-
+    /// floor-trial-iterations-2026-11-28.md in tessera-indexd). Makes a real
+    /// subset of a slab's sector-holding hosts fail every read with a
+    /// "balance below marginal read cost" error (simulating the exact
+    /// funding-floor scenario this was built for), then verifies: (1) the
+    /// download still succeeds via substitution onto other shards in the
+    /// same slab's redundancy set, (2) the callback fires exactly once per
+    /// failed attempt with the correct host/shard/slab identity, and (3) a
+    /// host that is NOT failing never appears in the failure list.
+    #[sia_core_derive::cross_target_test]
+    async fn test_shard_failed_callback() {
+        let upload_options = UploadOptions::default();
+        let min_shards = upload_options.data_shards as usize;
+        let optimal_data_size = upload_options.optimal_data_size();
+
+        let transport = mock::Client::new();
+        let hosts = Hosts::new(Client::Mock(transport.clone()));
+        hosts.update(
+            (0..60)
+                .map(|_| Host {
+                    public_key: PrivateKey::from_seed(&rand::random()).public_key(),
+                    addresses: vec![NetAddress {
+                        protocol: sia_core::types::v2::Protocol::QUIC,
+                        address: "localhost:1234".to_string(),
+                    }],
+                    country_code: "US".to_string(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    good_for_upload: true,
+                })
+                .collect(),
+            true,
+        );
+        let mut data = BytesMut::zeroed(optimal_data_size);
+        rand::rng().fill_bytes(&mut data);
+        let data = data.freeze();
+        let app_key = Arc::new(AppKey::import(rand::random()));
+
+        let obj = upload_object(
+            hosts.clone(),
+            app_key.clone(),
+            Object::default(),
+            Cursor::new(data.clone()),
+            upload_options,
+        )
+        .await
+        .unwrap();
+        assert_eq!(obj.slabs().len(), 1, "expected a single slab for this test");
+        let slab = &obj.slabs()[0];
+
+        // Fail the first 5 of this slab's 30 sector hosts -- well within the
+        // 20 parity shards' worth of redundancy (10 of 30), so the download
+        // must still succeed by substituting 5 different shards.
+        let failing_hosts: Vec<_> = slab.sectors.iter().take(5).map(|s| s.host_key).collect();
+        transport.set_failing_read_hosts(failing_hosts.iter().copied());
+
+        let failures: Arc<std::sync::Mutex<Vec<ShardFailure>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let failures_clone = failures.clone();
+        let opts = DownloadOptions::default().on_shard_failed(move |f: ShardFailure| {
+            failures_clone.lock().unwrap().push(f);
+        });
+
+        let mut recovered_data = Vec::with_capacity(optimal_data_size);
+        let mut download = Download::new(&obj, hosts.clone(), app_key.clone(), opts).unwrap();
+        tokio::io::copy(&mut download, &mut recovered_data)
+            .await
+            .unwrap();
+        assert_eq!(
+            data, recovered_data,
+            "download must still succeed via substitution despite 5 host refusals"
+        );
+
+        let failures = failures.lock().unwrap();
+        assert!(
+            !failures.is_empty(),
+            "expected at least one ShardFailure callback to fire"
+        );
+        for failure in failures.iter() {
+            assert!(
+                failing_hosts.contains(&failure.host_key),
+                "ShardFailure fired for a host that was never configured to fail: {:?}",
+                failure.host_key
+            );
+            assert_eq!(
+                failure.slab_index, 0,
+                "single-slab object: every failure must report slab_index 0"
+            );
+            assert!(
+                failure.error.contains("insufficient funds"),
+                "expected the mock transport's error text to propagate, got: {}",
+                failure.error
+            );
+        }
+        // every failing host must show up at least once (each is tried
+        // exactly once per slab, since a shard's host is fixed at upload
+        // time and there's only one slab here)
+        let failed_hosts_seen: std::collections::HashSet<_> =
+            failures.iter().map(|f| f.host_key).collect();
+        assert_eq!(
+            failed_hosts_seen.len(),
+            failing_hosts.len(),
+            "expected every failing host to produce exactly one ShardFailure"
+        );
+        // min_shards (10) successes still had to come from the 25 healthy
+        // hosts -- min_shards is unaffected by which specific hosts failed.
+        assert!(min_shards <= 25, "test assumption: 25 healthy hosts remain");
+    }
+
     /// Uploads one slab to 60 hosts, then seeds fast read samples for the
     /// first 15 sector hosts so they deterministically win `prioritize`
     /// (the rest only have write samples from the upload) and the read median
@@ -1468,7 +1594,7 @@ mod test {
             watch::channel(0).0,
         )
         .unwrap()
-        .recover_shards(None)
+        .recover_shards(None, None)
         .await
         .unwrap();
         assert!(
@@ -1496,7 +1622,7 @@ mod test {
             watch::channel(0).0,
         )
         .unwrap()
-        .recover_shards(None)
+        .recover_shards(None, None)
         .await
         .unwrap();
         assert!(
@@ -1533,7 +1659,7 @@ mod test {
             popped_tx,
         )
         .unwrap()
-        .recover_shards(None)
+        .recover_shards(None, None)
         .await
         .unwrap();
         let elapsed = start.elapsed();

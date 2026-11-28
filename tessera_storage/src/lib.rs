@@ -319,6 +319,47 @@ pub struct ShardProgress {
     pub elapsed: Duration,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub type ShardFailureCallback = Arc<dyn Fn(ShardFailure) + Send + Sync + 'static>;
+
+#[cfg(target_arch = "wasm32")]
+pub type ShardFailureCallback = Arc<dyn Fn(ShardFailure) + 'static>;
+
+/// Information about a shard read that was refused or otherwise failed during
+/// a download. This fires on EVERY refusal, including ones the download goes
+/// on to recover from by substituting a different shard from the same slab's
+/// redundancy set -- a `ShardFailure` does not imply the download failed, or
+/// even that this slab was ever in danger (a slab with min_shards=10 of 30
+/// total shards tolerates up to 20 of these before `NotEnoughShards`).
+///
+/// Added 2026-11-28 for the funding-floor empirical trial (see
+/// money/artifacts/TEST-PLAN-floor-trial-iterations-2026-11-28.md in
+/// tessera-indexd): this is the ONLY place in the download path where a
+/// per-shard, per-host refusal is observable at all -- the CLI logs nothing
+/// per-shard, and RHP4 traffic is client-to-host direct so no server-side
+/// ledger can ever see it either. Before this, every refusal was generated
+/// and then immediately discarded (see the `Err(_)` match arm this replaces
+/// in `download.rs`). Group by `slab_index` to get "max refusals in any one
+/// slab" directly, or bucket by wall-clock time (stamp it yourself in the
+/// callback -- this struct intentionally carries no wall-clock timestamp,
+/// only the RPC's own `elapsed`, mirroring `ShardProgress`) to align against
+/// indexd's funding-cycle ticks (`contracts/manager.go`'s
+/// `maintenanceFrequency`, 2 minutes by default) and see whether a given
+/// refusal happened in the same 2-minute window a host was topped back up.
+#[derive(Debug, Clone)]
+pub struct ShardFailure {
+    pub host_key: PublicKey,
+    pub shard_index: usize,
+    pub slab_index: usize,
+    pub elapsed: Duration,
+    /// `Display` of the underlying `DownloadError` for this one shard
+    /// attempt (e.g. an RHP4 error, a 60s timeout). Not further
+    /// structured/typed because `DownloadError`'s variants aren't `Clone`
+    /// (see the comment on `Download::errored`) and we don't want to force
+    /// that constraint onto every variant just to support this callback.
+    pub error: String,
+}
+
 /// Options for configuring a download.
 #[derive(Clone, Default)]
 pub struct DownloadOptions {
@@ -336,6 +377,12 @@ pub struct DownloadOptions {
     pub length: Option<u64>,
 
     pub shard_downloaded: Option<ShardProgressCallback>,
+
+    /// Optional callback fired on every shard read refusal/failure during
+    /// the download, including ones the download recovers from via a
+    /// different shard in the same slab. See [`ShardFailure`] for why this
+    /// is the only place such events are observable at all.
+    pub shard_failed: Option<ShardFailureCallback>,
 }
 
 impl DownloadOptions {
@@ -355,6 +402,26 @@ impl DownloadOptions {
         F: Fn(ShardProgress) + Send + Sync + 'static,
     {
         self.shard_downloaded = Some(Arc::new(callback));
+        self
+    }
+
+    /// Configures a callback to receive every shard read refusal/failure
+    /// during the download. See [`ShardFailure`].
+    #[cfg(target_arch = "wasm32")]
+    pub fn on_shard_failed<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(ShardFailure) + 'static,
+    {
+        self.shard_failed = Some(Arc::new(callback));
+        self
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn on_shard_failed<F>(mut self, callback: F) -> Self
+    where
+        F: Fn(ShardFailure) + Send + Sync + 'static,
+    {
+        self.shard_failed = Some(Arc::new(callback));
         self
     }
 }
