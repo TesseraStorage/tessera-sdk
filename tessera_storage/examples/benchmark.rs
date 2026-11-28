@@ -3,6 +3,7 @@ use std::error::Error;
 use std::io::{BufRead, stdin};
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -15,8 +16,8 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use tessera_storage::{
-    AppKey, AppMetadata, Builder, DownloadOptions, Object, Sdk, ShardFailure, UploadOptions,
-    generate_recovery_phrase,
+    AppKey, AppMetadata, Builder, DownloadOptions, Hash256, Object, Sdk, ShardFailure,
+    UploadOptions, generate_recovery_phrase,
 };
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, copy};
@@ -88,6 +89,29 @@ enum Command {
         /// events plus a summary: peak refusals in any single slab, and
         /// refusal counts bucketed into 2-minute funding-cycle windows
         /// (indexd's maintenanceFrequency) measured from download start.
+        #[arg(long)]
+        shard_failures_report: Option<PathBuf>,
+    },
+    /// Download an existing object by its key -- no upload. Use this
+    /// against an already-pinned object (e.g. the 50 GiB baseline) instead
+    /// of the upload+download roundtrip `run` does.
+    Download {
+        /// Hex-encoded object key (Hash256), as returned by the indexer /
+        /// whatever recorded it when the object was originally uploaded.
+        #[arg(long)]
+        object_key: String,
+
+        /// Maximum number of chunks buffered in memory during download.
+        #[arg(long)]
+        download_max_buffered_chunks: Option<usize>,
+
+        /// Write the downloaded bytes here instead of discarding them
+        /// (e.g. to sha256-check against a known-good hash afterwards).
+        #[arg(long)]
+        output: Option<PathBuf>,
+
+        /// Write a JSON shard-refusal report here (same format as `run`'s
+        /// --shard-failures-report).
         #[arg(long)]
         shard_failures_report: Option<PathBuf>,
     },
@@ -465,6 +489,106 @@ async fn warmup(
     let mut reader = sdk.download(&obj, download_options).await?;
     copy(&mut reader, &mut verifier).await?;
     download_progress.finish();
+    Ok(())
+}
+
+async fn download_only(
+    sdk: Sdk,
+    object_key: Hash256,
+    mut download_options: DownloadOptions,
+    output: Option<PathBuf>,
+    shard_failures_report: Option<PathBuf>,
+) -> Result<(), Box<dyn Error>> {
+    let obj = sdk.object(&object_key).await?;
+    println!("{:<15}{}", "Size:", format_bytes(obj.size()));
+    println!("{:<15}{}", "Encoded:", format_bytes(obj.encoded_size()));
+
+    let download_hosts: HostStats = Arc::new(Mutex::new(HashMap::new()));
+    let download_hosts_cb = download_hosts.clone();
+    download_options = download_options.on_shard_downloaded(move |p| {
+        record_shard(
+            &download_hosts_cb,
+            p.host_key.to_string(),
+            p.shard_size as u64,
+            p.elapsed,
+        );
+    });
+
+    let failures: Arc<Mutex<Vec<(Duration, ShardFailure)>>> = Arc::new(Mutex::new(Vec::new()));
+    let download_start_marker = Instant::now();
+    if shard_failures_report.is_some() {
+        let failures_cb = failures.clone();
+        download_options = download_options.on_shard_failed(move |f: ShardFailure| {
+            failures_cb
+                .lock()
+                .unwrap()
+                .push((download_start_marker.elapsed(), f));
+        });
+    }
+
+    let download_progress = progress_bar(obj.size(), "download");
+    let start = Instant::now();
+    let mut reader = sdk.download(&obj, download_options).await?;
+
+    let bytes_written: u64 = match output {
+        Some(path) => {
+            let mut file = fs::File::create(&path).await?;
+            copy(&mut reader, &mut file).await?
+        }
+        None => {
+            // Discard, but still track total bytes via a counting sink so
+            // the progress bar and final rate are accurate.
+            struct CountingSink(u64, ProgressBar);
+            impl AsyncWrite for CountingSink {
+                fn poll_write(
+                    mut self: Pin<&mut Self>,
+                    _: &mut Context<'_>,
+                    buf: &[u8],
+                ) -> Poll<std::io::Result<usize>> {
+                    self.0 += buf.len() as u64;
+                    self.1.set_position(self.0);
+                    Poll::Ready(Ok(buf.len()))
+                }
+                fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+                fn poll_shutdown(
+                    self: Pin<&mut Self>,
+                    _: &mut Context<'_>,
+                ) -> Poll<std::io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+            }
+            let mut sink = CountingSink(0, download_progress.clone());
+            copy(&mut reader, &mut sink).await?;
+            sink.0
+        }
+    };
+    let download_duration = start.elapsed();
+    download_progress.finish();
+
+    if bytes_written != obj.size() {
+        return Err(format!(
+            "downloaded {bytes_written} bytes, expected {} -- treat as a failed run",
+            obj.size()
+        )
+        .into());
+    }
+
+    println!("\nDownload");
+    println!("  {:<15}{:?}", "Elapsed:", download_duration);
+    println!(
+        "  {:<15}{}",
+        "Rate:",
+        format_bitrate(obj.size(), download_duration)
+    );
+
+    print_host_summary("Download", &download_hosts);
+
+    if let Some(path) = shard_failures_report {
+        write_shard_failures_report(&path, &failures, download_duration)?;
+        println!("\nShard failures report written to {}", path.display());
+    }
     Ok(())
 }
 
@@ -870,6 +994,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
             .await;
             Ok(())
+        }
+        Command::Download {
+            object_key,
+            download_max_buffered_chunks,
+            output,
+            shard_failures_report,
+        } => {
+            let sdk = connect(&cli.profile).await?;
+            let object_key = Hash256::from_str(object_key.trim())
+                .map_err(|e| format!("invalid --object-key: {e}"))?;
+            let download_options = DownloadOptions {
+                max_buffered_chunks: download_max_buffered_chunks,
+                ..Default::default()
+            };
+            download_only(
+                sdk,
+                object_key,
+                download_options,
+                output,
+                shard_failures_report,
+            )
+            .await
         }
         Command::Profiles => list_profiles().await,
     }
